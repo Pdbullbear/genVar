@@ -161,9 +161,28 @@ npm run dn -- run --pair XAU --mode carry --dir short_perp \
   --perp-funding 0.01 --swap-long-funding 0.012 --live         # funding carry
 ```
 
-**Funding isn't in the API.** Read each leg's current rates in the Omni app (hover the funding rate)
-and pass them in. They are used to value the carry. Afterwards, check the positions' `cum_funding`;
-the bot prints it while a position is open.
+**Funding rates are pulled automatically** with `--auto-funding` (the web panel turns it on by
+default). They come from Omni's public stats feed, `GET /metadata/v2/stats`, which publishes the same
+numbers the app shows. It needs no key and costs no API weight. The documented host is mainnet's;
+testnet mirrors its rates, which I checked against the testnet app. Set `OMNI_STATS_URL` to use
+another feed.
+
+With auto funding, the bot:
+- refreshes the rates every 15 minutes;
+- takes the round-trip cost from the quoted bid/ask spreads;
+- in carry mode, only enters while carry for the chosen direction is positive;
+- with `--exit-if-negative-carry-hours N`, exits (and pauses entries) once carry has stayed negative
+  for N hours.
+
+The rates need two corrections:
+- **Weekend payments.** Swap payments that cover a weekend are published at about 3× the daily rate,
+  so the bot normalises them to a regular day.
+- **Futures-roll swaps.** For futures-referenced swaps (oil, copper, gas, cocoa, VIX, dollar index),
+  the funding just offsets the index rolling along the futures curve. A hedged position gives it back
+  through the price, so it isn't real carry: the bot flags these and won't enter them.
+
+You can still pass `--perp-funding` / `--swap-long-funding` / `--swap-short-funding` by hand.
+Afterwards, check the positions' `cum_funding`; the bot prints it while a position is open.
 
 ### How it stays safe
 

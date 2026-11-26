@@ -8,6 +8,7 @@
 // The API exposes mark prices but not funding rates, so the spread is measured live while funding is
 // configured from what the app shows, and checked afterwards against the positions' cum_funding.
 import type { Instrument } from "../../sdk/index.js";
+import { listing, perpFunding, swapFunding, type Stats } from "../../sdk/stats.js";
 
 export type Kind = "perp" | "swap";
 
@@ -188,4 +189,62 @@ export function signal(stats: SpreadStats, logRatio: number, p: SignalParams, f:
   if (edgeBps < p.minEdgeBps)
     return { action: "hold", reason: `edge ${edgeBps.toFixed(1)}bp < ${p.minEdgeBps}bp after ${p.roundTripBps}bp costs`, devBps, z, edgeBps };
   return { action: "enter", dir, reason: `z ${z.toFixed(2)}, dev ${devBps.toFixed(1)}bp, edge ${edgeBps.toFixed(1)}bp`, devBps, z, edgeBps };
+}
+
+// ---------- funding from the public stats feed ----------
+
+export interface PairFunding {
+  /** In the bot's units (see Funding). */
+  funding: Funding;
+  /** Annualized fractions as published (swap rates normalised to a regular day). */
+  perpAnnual: number;
+  swapLongPays: number;
+  swapShortReceives: number;
+  /** Net carry per year as a fraction, for each direction. */
+  carryAnnual: Record<Dir, number>;
+  best: Dir | null;
+  /** Round-trip cost estimate: four fills, each paying half the quoted bid/ask spread of its leg. */
+  roundTripBps: number;
+  perpSpreadBps: number;
+  swapSpreadBps: number;
+  perpMark: number;
+  swapMark: number;
+  nextPerpAt: number | null;
+  nextSwapAt: number | null;
+  swapNextIsMultiDay: boolean;
+  /**
+   * Futures-referenced swaps (oil, copper, gas, cocoa, VIX, dollar index) are paid funding to offset
+   * their index rolling down/up the futures curve, so that funding isn't real carry for a hedged
+   * position: the swap gives it back through its price, and the perp rolls on its own schedule.
+   */
+  curveCarry: boolean;
+}
+
+/** Swap codes whose funding is the futures-curve roll (per docs.variational.io/omni/trading/swaps). */
+export const CURVE_CARRY_SWAPS = ["USOIL", "UKOIL", "COPP", "COCOA", "VXI", "DXI", "GASOL", "HOIL", "NTGAS"];
+
+export function pairFunding(stats: Stats, perpSymbol: string, swapSymbol: string): PairFunding | null {
+  const pl = listing(stats, perpSymbol), sl = listing(stats, swapSymbol);
+  if (!pl || !sl) return null;
+  const pf = perpFunding(pl), sf = swapFunding(sl);
+  if (!pf || !sf || ![pf.annual, sf.longPays, sf.shortReceives].every(Number.isFinite)) return null;
+  const carryAnnual: Record<Dir, number> = {
+    long_perp: -pf.annual + sf.shortReceives, // pay perp funding (if positive), receive the swap short rate
+    short_perp: pf.annual - sf.longPays, // receive perp funding, pay the swap long rate
+  };
+  const curveCarry = CURVE_CARRY_SWAPS.includes(swapSymbol.toUpperCase().replace(/-SWAP$/, ""));
+  const best: Dir | null = curveCarry ? null : Math.max(carryAnnual.long_perp, carryAnnual.short_perp) > 0
+    ? (carryAnnual.long_perp >= carryAnnual.short_perp ? "long_perp" : "short_perp") : null;
+  const perpSpreadBps = Number(pl.base_spread_bps), swapSpreadBps = Number(sl.base_spread_bps);
+  return {
+    funding: {
+      perpPct8h: (pf.annual * 100) / (365 * 3),
+      swapLongPctDay: (sf.longPays * 100) / 360,
+      swapShortPctDay: (-sf.shortReceives * 100) / 360,
+    },
+    perpAnnual: pf.annual, swapLongPays: sf.longPays, swapShortReceives: sf.shortReceives, carryAnnual, best,
+    roundTripBps: Math.max(2, +(perpSpreadBps + swapSpreadBps).toFixed(2)), perpSpreadBps, swapSpreadBps,
+    perpMark: Number(pl.mark_price), swapMark: Number(sl.mark_price),
+    nextPerpAt: pf.nextAt, nextSwapAt: sf.nextAt, swapNextIsMultiDay: sf.nextIsMultiDay, curveCarry,
+  };
 }

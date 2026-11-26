@@ -11,7 +11,8 @@
 import { parseArgs } from "node:util";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { OmniClient, OmniError, checkOrder, dec, type Instrument, type Order, type Position, type Ticker } from "../../sdk/index.js";
-import { SpreadStats, carryBpsPerDay, correlation, discoverPairs, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
+import { fetchStats } from "../../sdk/stats.js";
+import { SpreadStats, carryBpsPerDay, correlation, discoverPairs, pairFunding, type PairFunding, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
 
 const cmd = process.argv[2];
 // Accept "--flag -0.0065" as well as "--flag=-0.0065": node's parseArgs reads a leading "-" as an option.
@@ -35,6 +36,8 @@ const { values: a } = parseArgs({
     "half-life-min": { type: "string", default: "60" },
     "min-samples": { type: "string", default: "30" },
     "perp-funding": { type: "string", default: "0" },
+    "auto-funding": { type: "boolean", default: false },
+    "exit-if-negative-carry-hours": { type: "string", default: "0" },
     "swap-long-funding": { type: "string", default: "0" },
     "swap-short-funding": { type: "string", default: "0" },
     "max-slippage-pct": { type: "string", default: "0.5" },
@@ -309,6 +312,33 @@ let cycleN = 0;
 let lastFunding: { perp: number; swap: number; at: number } | null = null;
 let lastLiq: { perp: string | null; swap: string | null } | null = null;
 let carryWarned = 0;
+let auto: PairFunding | null = null;
+let autoAt = 0;
+let autoErr: string | null = null;
+let negativeSince: number | null = null;
+let lastEntryNote: string | null = null;
+
+/** With --auto-funding, pull rates and quoted spreads from the public stats feed every 15 minutes. */
+async function refreshFunding(force = false) {
+  if (!a["auto-funding"] || (!force && Date.now() - autoAt < 15 * 60_000)) return;
+  autoAt = Date.now();
+  try {
+    const pf = pairFunding(await fetchStats(), pair.perp.symbol, pair.swap.symbol);
+    if (!pf) throw new Error(`no funding data for ${pair.perp.symbol}/${pair.swap.symbol} in the stats feed`);
+    const changed = !auto || Math.abs(pf.perpAnnual - auto.perpAnnual) > 1e-6 || Math.abs(pf.swapLongPays - auto.swapLongPays) > 1e-6 || Math.abs(pf.swapShortReceives - auto.swapShortReceives) > 1e-6;
+    auto = pf;
+    autoErr = null;
+    Object.assign(F, pf.funding);
+    SP.roundTripBps = pf.roundTripBps;
+    if (changed) say(`funding (auto): perp ${(pf.perpAnnual * 100).toFixed(2)}%/yr, swap longs pay ${(pf.swapLongPays * 100).toFixed(2)}%, shorts receive ${(pf.swapShortReceives * 100).toFixed(2)}% → ` +
+      `carry long perp ${(pf.carryAnnual.long_perp * 100).toFixed(2)}%/yr, short perp ${(pf.carryAnnual.short_perp * 100).toFixed(2)}%/yr · round trip ≈${pf.roundTripBps}bp` +
+      (pf.curveCarry ? " · NOTE: futures-roll funding, not real carry" : ""));
+  } catch (e) {
+    autoErr = (e as Error).message;
+    say(`funding refresh failed (keeping the last rates): ${autoErr}`);
+    autoAt = Date.now() - 13 * 60_000; // retry in ~2 minutes
+  }
+}
 async function cycle() {
   const [pi, si] = [await inst(pair.perp.symbol), await inst(pair.swap.symbol)];
   const [tp, tsw] = [await client.ticker(pair.perp.symbol), await client.ticker(pair.swap.symbol)];
@@ -362,6 +392,17 @@ async function cycle() {
     if (c === "exit" && t) exitRequested = true;
     if (c === "resume") { state.paused = null; say("entries resumed"); save(); }
   }
+  // ---------- auto funding: live rates from the public stats feed ----------
+  await refreshFunding();
+  if (a.mode === "carry" && auto) {
+    const dir = (t?.dir ?? a.dir) as Dir;
+    const c = auto.carryAnnual[dir];
+    if (c < 0) {
+      if (!negativeSince) { negativeSince = Date.now(); say(`warning: carry for ${dir} turned negative (${(c * 100).toFixed(2)}%/yr)`); }
+      const hrs = +a["exit-if-negative-carry-hours"]!;
+      if (t && hrs > 0 && Date.now() - negativeSince > hrs * 3.6e6) return exit(`carry negative for ${hrs}h (${(c * 100).toFixed(2)}%/yr)`, pm, sm, swapOpen);
+    } else if (negativeSince) { negativeSince = null; say(`carry for ${dir} is positive again (${(c * 100).toFixed(2)}%/yr)`); }
+  }
   // Sticky: if the exit is deferred (e.g. waiting for rate-limit weight), keep trying every cycle.
   if (exitRequested && t) return exit("manual exit requested", pm, sm, swapOpen);
   if (t) {
@@ -378,7 +419,13 @@ async function cycle() {
     if (a.mode === "carry") {
       const dir = a.dir as Dir;
       const carry = carryBpsPerDay(dir, F);
-      if (canEnter) {
+      const autoBlock = !auto ? null : auto.curveCarry ? "this swap's funding offsets its futures roll, so it isn't real carry"
+        : auto.carryAnnual[dir] <= 0 ? `carry for ${dir} is ${(auto.carryAnnual[dir] * 100).toFixed(2)}%/yr` : null;
+      if (autoBlock) {
+        if (lastEntryNote !== autoBlock) { say(`not entering: ${autoBlock}`); lastEntryNote = autoBlock; }
+        snap.entryBlocked = autoBlock;
+      } else if (canEnter) {
+        snap.entryBlocked = null;
         if (carry * (SP.holdHours / 24) < SP.roundTripBps && !carryWarned++) say(`note: expected carry ${carry.toFixed(1)}bp/day doesn't cover ${SP.roundTripBps}bp costs over ${SP.holdHours}h`);
         await enter(dir, tp, tsw, sig.devBps);
       }
@@ -402,6 +449,8 @@ function emitStatus() {
     trade: tr ? { ...tr, pnl: pm && sm ? +legsPnl(tr, pm, sm).toFixed(4) : null } : null,
     realizedUsd: state?.realizedUsd ?? 0, trades: state?.trades ?? 0, funding: lastFunding, liq: lastLiq,
     exitPending: exitRequested, paused: state?.paused ?? null, blocked,
+    rates: auto ? { perpAnnual: auto.perpAnnual, swapLongPays: auto.swapLongPays, swapShortReceives: auto.swapShortReceives, carryAnnual: auto.carryAnnual,
+      best: auto.best, roundTripBps: auto.roundTripBps, curveCarry: auto.curveCarry, at: autoAt, err: autoErr, negativeSince } : null,
     weight: client.budget.remaining, limit: client.budget.limit,
   }));
 }

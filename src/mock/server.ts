@@ -37,6 +37,8 @@ const markets = new Map<string, Mkt>([
   ["DOGE-PERP", { inst: mkInst("DOGE-PERP", "DOGE", "1"), index: 0.18, basis: 0, vol: 0.0012, t: Date.now() }],
   ["XAU-PERP", { inst: mkInst("XAU-PERP", "XAU", "0.0001"), index: 4100, basis: 0, vol: 0.0003, t: Date.now() }],
   ["US500-PERP", { inst: mkInst("US500-PERP", "US500", "0.001"), index: 690, basis: 0, vol: 0.0003, t: Date.now() }],
+  ["XAG-PERP", { inst: mkInst("XAG-PERP", "XAG", "0.001"), index: 41.6, basis: 0, vol: 0.0004, t: Date.now() }],
+  ["XAG-SWAP", { inst: mkSwap("XAG-SWAP", "XAG", "0.001"), index: 41.6, basis: 0, vol: 0, t: Date.now(), link: { perp: "XAG-PERP", ratio: 1, dev: 0 } }],
   ["XAU-SWAP", { inst: mkSwap("XAU-SWAP", "XAU", "0.0001"), index: 4100, basis: 0, vol: 0, t: Date.now(), link: { perp: "XAU-PERP", ratio: 1, dev: 0 } }],
   // Different price level on purpose: an index swap vs an ETF-basket perp need not trade at parity.
   ["US500-SWAP", { inst: mkSwap("US500-SWAP", "US500", "0.0001"), index: 6900, basis: 0, vol: 0, t: Date.now(), link: { perp: "US500-PERP", ratio: 10, dev: 0 } }],

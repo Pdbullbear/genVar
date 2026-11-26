@@ -14,7 +14,8 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OmniClient, OmniError, type Ticker } from "../sdk/index.js";
-import { discoverPairs, carryBpsPerDay, type Pair } from "../bot/dn/core.js";
+import { discoverPairs, carryBpsPerDay, pairFunding, type Pair } from "../bot/dn/core.js";
+import { fetchStats } from "../sdk/stats.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -48,18 +49,28 @@ const account = cached(20_000, async () => {
 });
 const instruments = cached(300_000, () => client.instruments());
 const tickers = cached(30_000, () => client.tickers());
+// Public stats feed (funding + quoted spreads): separate rate limit, costs no trading weight.
+const stats = cached(60_000, () => fetchStats());
 async function pairs() {
   const [i, t] = [await instruments(), await tickers()];
   const tk = new Map<string, Ticker>((t.data ?? []).map((x) => [x.symbol, x]));
+  const st = await stats();
   const list = discoverPairs(i.data ?? []).map((p: Pair) => {
     const pm = Number(tk.get(p.perp.symbol)?.mark_price), sm = Number(tk.get(p.swap.symbol)?.mark_price);
+    const f = st.data ? pairFunding(st.data, p.perp.symbol, p.swap.symbol) : null;
     return {
+      funding: f && {
+        perpAnnual: f.perpAnnual, swapLongPays: f.swapLongPays, swapShortReceives: f.swapShortReceives, carryAnnual: f.carryAnnual,
+        best: f.best, roundTripBps: f.roundTripBps, curveCarry: f.curveCarry, nextPerpAt: f.nextPerpAt, nextSwapAt: f.nextSwapAt,
+        // Breakeven in days for each direction, at the quoted spreads.
+        breakevenDays: Object.fromEntries((["long_perp", "short_perp"] as const).map((d) => [d, f.carryAnnual[d] > 0 ? Math.ceil(f.roundTripBps / (f.carryAnnual[d] * 1e4 / 365)) : null])),
+      },
       key: p.key, perp: p.perp.symbol, swap: p.swap.symbol, perpMark: pm || null, swapMark: sm || null,
       gapBps: pm && sm ? +((Math.log(pm / sm)) * 1e4).toFixed(2) : null,
       swapStatus: p.swap.status, nextClose: p.swap.next_close_at, nextOpen: p.swap.next_open_at,
     };
   });
-  return { pairs: list, err: i.err ?? t.err, at: t.at };
+  return { pairs: list, err: i.err ?? t.err, fundingErr: st.err, fundingAt: st.at, at: t.at };
 }
 
 // ---------- bots ----------
@@ -103,6 +114,7 @@ function startBot(cfg: any) {
     ...num("hold-hours", cfg.holdHours), ...num("max-hold-hours", cfg.maxHoldHours),
     ...num("stop-loss-usd", cfg.stopLossUsd), ...num("entry-z", cfg.entryZ), ...num("exit-z", cfg.exitZ),
     ...num("round-trip-bps", cfg.roundTripBps), ...num("poll", cfg.poll),
+    ...(cfg.autoFunding ? ["--auto-funding"] : []), ...num("exit-if-negative-carry-hours", cfg.exitIfNegativeCarryHours),
     ...(live ? ["--live"] : [])];
   const proc = spawn(process.execPath, args, { cwd: ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   const bot: Bot = {
@@ -279,9 +291,11 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && p === "/api/carry") {
       // Carry calculator: rates as the app shows them (APR %), converted to the bot's units.
       const b = await body(req);
-      const f = { perpPct8h: Number(b.perpApr) / 365 / 3, swapLongPctDay: Number(b.swapLongPayApr) / 365, swapShortPctDay: -Number(b.swapShortReceiveApr) / 365 };
-      const day = { short_perp: carryBpsPerDay("short_perp", f), long_perp: carryBpsPerDay("long_perp", f) };
-      return json(res, 200, { ...f, bpsPerDay: day, aprPct: { short_perp: (day.short_perp * 365) / 100, long_perp: (day.long_perp * 365) / 100 } });
+      const f = { perpPct8h: Number(b.perpApr) / 365 / 3, swapLongPctDay: Number(b.swapLongPayApr) / 360, swapShortPctDay: -Number(b.swapShortReceiveApr) / 360 };
+      const apr = { long_perp: -Number(b.perpApr) + Number(b.swapShortReceiveApr), short_perp: Number(b.perpApr) - Number(b.swapLongPayApr) };
+      const day = { long_perp: (apr.long_perp * 100) / 365, short_perp: (apr.short_perp * 100) / 365 };
+      void carryBpsPerDay;
+      return json(res, 200, { ...f, bpsPerDay: day, aprPct: apr });
     }
     if (req.method === "POST" && p === "/api/scan") return (startScan(Number((await body(req)).minutes)), json(res, 200, { ok: true }));
     if (req.method === "GET" && p === "/api/scan") return json(res, 200, scan ? { ...scan, proc: undefined } : null);

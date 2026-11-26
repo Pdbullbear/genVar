@@ -144,13 +144,17 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
           <div class="seg" id="fMode"><button data-v="carry" class="on">Funding carry</button><button data-v="stat">Spread reversion</button></div>
         </div>
         <div id="carryBox" class="form">
-          <div class="hint">Funding rates as the Omni app shows them (hover the funding rate). Annual %, positive numbers.</div>
+          <label style="display:flex; align-items:center; gap:8px; color:var(--text); font-size:13px">
+            <input id="fAuto" type="checkbox" checked style="width:auto"> Pull funding rates from Omni automatically
+          </label>
+          <div class="hint" id="autoHint">Filled from Omni's public stats feed (the numbers the app shows) and refreshed by the bot every 15 minutes. Untick to type your own.</div>
           <div class="grid3">
             <label>Perp annual funding % <input id="fPerpApr" type="number" step="0.01" value="0"></label>
             <label>Swap: longs pay APR % <input id="fSwapLong" type="number" step="0.01" value="0"></label>
             <label>Swap: shorts receive APR % <input id="fSwapShort" type="number" step="0.01" value="0"></label>
           </div>
           <div class="calc" id="calc"></div>
+          <label id="negBox">Exit if carry stays negative for (hours, 0 = never) <input id="fNegHours" type="number" value="12" min="0"></label>
           <label>Direction
             <select id="fDir"><option value="long_perp">Long perp · short swap</option><option value="short_perp">Short perp · long swap</option></select>
           </label>
@@ -170,7 +174,7 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
           <input id="fLive" type="checkbox" style="width:auto"> Live trading <span class="hint">(unchecked = dry run with paper fills)</span>
         </label>
         <button class="primary" id="startBtn">Start dry run</button>
-        <div class="hint">Funding isn't in the API, so carry uses the rates you enter. Recheck them in the app every few days.</div>
+        <div class="hint">Rates come from Omni's public stats feed (the numbers the app shows; it costs no API weight). With auto on, a carry bot follows them live.</div>
       </div>
     </section>
   </div>
@@ -178,7 +182,7 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
   <section class="card">
     <h2>Perp ⇄ swap pairs <span class="right muted" id="pairsAt"></span></h2>
     <div class="scroll"><table id="pairs"><thead><tr>
-      <th>Pair</th><th>Perp</th><th>Swap</th><th class="num">Perp mark</th><th class="num">Swap mark</th><th class="num">Perp premium</th><th>Swap market</th><th></th>
+      <th>Pair</th><th>Perp</th><th>Swap</th><th class="num">Perp mark</th><th class="num">Swap mark</th><th class="num">Perp premium</th><th class="num" title="Funding carry per year, net of both legs">Carry: long perp</th><th class="num">Carry: short perp</th><th class="num" title="Four fills at the quoted bid/ask spreads">Round trip</th><th>Swap market</th><th></th>
     </tr></thead><tbody><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div>
   </section>
 
@@ -273,11 +277,50 @@ async function loadPairs() {
     $("#pairs tbody").innerHTML = PAIRS.length ? PAIRS.map((p) => `<tr>
       <td><b>${esc(p.key)}</b></td><td>${esc(p.perp)}</td><td>${esc(p.swap)}</td>
       <td class="num">${px(p.perpMark)}</td><td class="num">${px(p.swapMark)}</td><td class="num">${p.gapBps == null ? "–" : Math.abs(p.gapBps) > 1000 ? `<span class="muted" title="The legs trade on different price scales">×${(p.perpMark / p.swapMark).toPrecision(4)}</span>` : signed(p.gapBps, 1, "bp")}</td>
+      ${carryCells(p.funding)}
       <td>${fmtClose(p)}</td><td><button class="small" data-use="${esc(p.key)}">Use</button></td></tr>`).join("")
-      : `<tr><td colspan="8" class="empty">${r.err ? esc(r.err) : "No perp/swap pairs found"}</td></tr>`;
-    document.querySelectorAll("[data-use]").forEach((b) => b.onclick = () => { $("#fPair").value = b.dataset.use; $("#fPair").scrollIntoView({ behavior: "smooth", block: "center" }); });
-  } catch (e) { $("#pairs tbody").innerHTML = `<tr><td colspan="8" class="err">${esc(e.message)}</td></tr>`; }
+      : `<tr><td colspan="11" class="empty">${r.err ? esc(r.err) : "No perp/swap pairs found"}</td></tr>`;
+    document.querySelectorAll("[data-use]").forEach((b) => b.onclick = () => { $("#fPair").value = b.dataset.use; autofill(); $("#fPair").scrollIntoView({ behavior: "smooth", block: "center" }); });
+    $("#pairsAt").textContent = (r.at ? "prices " + ago(r.at) : "") + (r.fundingAt ? ` · funding ${ago(r.fundingAt)}` : "") + (r.fundingErr ? ` · funding feed error: ${r.fundingErr}` : "");
+    if (!autofilled) autofill();
+  } catch (e) { $("#pairs tbody").innerHTML = `<tr><td colspan="11" class="err">${esc(e.message)}</td></tr>`; }
 }
+
+// ---------- funding ----------
+const pct = (x, d = 2) => (x == null || isNaN(x)) ? "–" : signed(x * 100, d, "%");
+function carryCells(f) {
+  if (!f) return `<td class="num muted">–</td><td class="num muted">–</td><td class="num muted">–</td>`;
+  const cell = (d) => {
+    const be = f.breakevenDays?.[d];
+    const star = f.best === d ? " ★" : "";
+    return `<td class="num" title="${be ? `break-even ≈ ${be} days` : "doesn't earn"}">${f.curveCarry ? `<span class="muted">${(f.carryAnnual[d] * 100).toFixed(2)}%</span>` : pct(f.carryAnnual[d])}${star}${be && !f.curveCarry ? `<div class="hint">${be}d to break even</div>` : ""}</td>`;
+  };
+  return cell("long_perp") + cell("short_perp") + `<td class="num">${n(f.roundTripBps, 1)}bp${f.curveCarry ? `<div class="hint" title="This swap's funding offsets its futures roll; a hedged position gives it back through the price">roll carry, not real</div>` : ""}</td>`;
+}
+
+// Fill the three rate fields (and costs) from the feed for the selected pair.
+let autofilled = false;
+function autofill() {
+  if (!$("#fAuto").checked) return;
+  const p = PAIRS.find((x) => x.key === $("#fPair").value);
+  const f = p?.funding;
+  if (!f) { $("#autoHint").textContent = "No funding data for this pair in Omni's feed; untick to type rates yourself."; return; }
+  $("#fPerpApr").value = +(f.perpAnnual * 100).toFixed(4);
+  $("#fSwapLong").value = +(f.swapLongPays * 100).toFixed(4);
+  $("#fSwapShort").value = +(f.swapShortReceives * 100).toFixed(4);
+  $("#fCost").value = f.roundTripBps;
+  $("#autoHint").innerHTML = `From Omni's public stats feed${f.curveCarry ? ` · <b class="neg">this swap's funding offsets its futures roll, so it isn't real carry: the bot won't enter</b>` : ""}. The bot refreshes these every 15 minutes and only enters while the carry is positive.`;
+  autofilled = true;
+  calc();
+}
+$("#fPair").onchange = autofill;
+$("#fAuto").onchange = () => {
+  const on = $("#fAuto").checked;
+  ["#fPerpApr", "#fSwapLong", "#fSwapShort"].forEach((s) => $(s).readOnly = on);
+  $("#negBox").style.display = on ? "" : "none";
+  if (on) autofill(); else $("#autoHint").textContent = "Type the rates the Omni app shows (annual %, positive numbers).";
+};
+["#fPerpApr", "#fSwapLong", "#fSwapShort"].forEach((s) => $(s).readOnly = true);
 
 // ---------- form ----------
 let MODE = "carry";
@@ -316,7 +359,10 @@ $("#startBtn").onclick = async () => {
     pair, live, mode: MODE, dir: $("#fDir").value, notionalUsd: +$("#fNotional").value,
     stopLossUsd: +$("#fStop").value, maxHoldHours: +$("#fMaxHold").value, roundTripBps: +$("#fCost").value,
     entryZ: +$("#fEntryZ").value, exitZ: +$("#fExitZ").value, poll: +$("#fPoll").value,
-    ...(MODE === "carry" ? { perpFunding: f.perpPct8h ?? 0, swapLongFunding: f.swapLongPctDay ?? 0, swapShortFunding: f.swapShortPctDay ?? 0, holdHours: 720 } : {}),
+    ...(MODE === "carry" ? {
+      perpFunding: f.perpPct8h ?? 0, swapLongFunding: f.swapLongPctDay ?? 0, swapShortFunding: f.swapShortPctDay ?? 0, holdHours: 720,
+      autoFunding: $("#fAuto").checked, exitIfNegativeCarryHours: $("#fAuto").checked ? +$("#fNegHours").value : 0,
+    } : {}),
   };
   if (live && !confirm(`Start a LIVE ${MODE} bot on ${pair} with ${cfg.notionalUsd} USD per leg?${MODE === "carry" ? `\nDirection: ${cfg.dir.replace("_", " ")}` : ""}`)) return;
   try { const r = await api("/api/bots/start", cfg); toast(`Started ${r.key}`); loadBots(); } catch (e) { toast(e.message); }
@@ -390,7 +436,9 @@ async function loadBots() {
           <div class="chart"><div class="k"><span>Legs PnL ($)</span><span>${t ? n(t.pnl) : ""}</span></div>${spark(b.series, "pnl", "var(--accent)")}</div>
           <div class="chart"><div class="k"><span>Spread vs mean (bp)</span><span>${n(s.devBps, 1)}</span></div>${spark(b.series, "dev", "var(--amber)")}</div>
         </div>
-        <div class="hint">${b.cfg?.mode === "carry" ? (t ? "Holding for funding: exits only on a safety limit or when you press Exit. The bot keeps running until you press Stop." : s.paused ? "" : "Flat: enters when the swap market is open.") : esc(s.signal || "")}</div>
+        ${s.rates ? `<div class="hint">Carry now (${esc((dir || "").replace("_", " "))}): <b>${pct(s.rates.carryAnnual[dir || "long_perp"])}/yr</b> · perp ${pct(s.rates.perpAnnual)} · swap longs pay ${pct(s.rates.swapLongPays)}, shorts receive ${pct(s.rates.swapShortReceives)} · round trip ${n(s.rates.roundTripBps, 1)}bp · rates ${ago(s.rates.at)}${s.rates.err ? ` · <span class="neg">feed error: ${esc(s.rates.err)}</span>` : ""}${s.rates.negativeSince ? ` · <span class="neg">negative since ${new Date(s.rates.negativeSince).toLocaleTimeString()}</span>` : ""}${s.rates.curveCarry ? ` · <span class="neg">roll carry, not real</span>` : ""}</div>` : ""}
+        ${s.entryBlocked && !t ? `<div class="note">Not entering: ${esc(s.entryBlocked)}. It enters on its own once the carry turns positive.</div>` : ""}
+        <div class="hint">${b.cfg?.mode === "carry" ? (t ? "Holding for funding: exits only on a safety limit or when you press Exit. The bot keeps running until you press Stop." : s.paused || s.entryBlocked ? "" : "Flat: enters when the swap market is open.") : esc(s.signal || "")}</div>
         <details data-log="${esc(b.key)}" ${openLogs.has(b.key) ? "open" : ""}><summary>Log & fills</summary>
           ${fills.length ? `<table style="margin-top:6px"><thead><tr><th>Time</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Slippage</th></tr></thead><tbody>${fills.slice(-8).reverse().map((f) => `<tr><td>${new Date(f.t).toLocaleTimeString()}</td><td>${esc(f.symbol)}</td><td class="${f.side === "buy" ? "pos" : "neg"}">${esc(f.side)}</td><td class="num">${esc(f.size)}</td><td class="num">${px(f.price)}</td><td class="num">${n(f.slippageBps, 1)}bp</td></tr>`).join("")}</tbody></table>` : ""}
           <pre>${esc(b.log.slice(-60).join("\n"))}</pre>
