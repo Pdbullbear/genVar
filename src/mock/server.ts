@@ -15,6 +15,7 @@ const ENV = process.env.MOCK_ENV ?? "testnet";
 const WEIGHT_LIMIT = Number(process.env.MOCK_WEIGHT ?? 60);
 const START_COLLATERAL = 10_000;
 const LEVERAGE = 10;
+const OLP_HALF_SPREAD = Number(process.env.MOCK_OLP_SPREAD_BPS ?? 3) / 1e4;
 
 // ---------- Market ----------
 interface Mkt { inst: Instrument; index: number; basis: number; vol: number; t: number }
@@ -30,6 +31,7 @@ const markets = new Map<string, Mkt>([
   ["BTC-PERP", { inst: mkInst("BTC-PERP", "BTC", "0.00001"), index: 95000, basis: 0, vol: 0.0006, t: Date.now() }],
   ["ETH-PERP", { inst: mkInst("ETH-PERP", "ETH", "0.0001"), index: 3500, basis: 0, vol: 0.0008, t: Date.now() }],
   ["SOL-PERP", { inst: mkInst("SOL-PERP", "SOL", "0.01"), index: 180, basis: 0, vol: 0.001, t: Date.now() }],
+  ["HYPE-PERP", { inst: mkInst("HYPE-PERP", "HYPE", "0.001"), index: 62, basis: 0, vol: 0.0012, t: Date.now() }],
   ["DOGE-PERP", { inst: mkInst("DOGE-PERP", "DOGE", "1"), index: 0.18, basis: 0, vol: 0.0012, t: Date.now() }],
 ]);
 const mark = (m: Mkt) => m.index * (1 + m.basis);
@@ -46,18 +48,20 @@ function tick() {
   for (const acct of accounts.values()) processTriggers(acct);
 }
 setInterval(tick, 1000).unref();
+// Limit orders are checked against the quote far more often than prices move (Omni: every 0.1s).
+setInterval(() => { for (const a of accounts.values()) processTriggers(a); }, 200).unref();
 
 // ---------- Accounts ----------
 interface Pos { size: number; entry: number; realized: number; opened: number; updated: number }
 interface Acct {
   key: string; collateral: number; positions: Map<string, Pos>; orders: Order[]; fills: Fill[];
-  spent: { t: number; w: number }[]; sigs: Set<string>;
+  spent: { t: number; w: number }[]; sigs: Set<string>; strikes: number; bannedUntil: number;
 }
 const accounts = new Map<string, Acct>();
 function acct(key: string): Acct {
   let a = accounts.get(key);
   if (!a) {
-    a = { key, collateral: START_COLLATERAL, positions: new Map(), orders: [], fills: [], spent: [], sigs: new Set() };
+    a = { key, collateral: START_COLLATERAL, positions: new Map(), orders: [], fills: [], spent: [], sigs: new Set(), strikes: 0, bannedUntil: 0 };
     accounts.set(key, a);
   }
   return a;
@@ -159,7 +163,7 @@ function execute(a: Acct, o: Order, refPrice?: number) {
     size = Math.min(size, Math.abs(pos));
   }
   // OLP quote: mark ± 3 bps spread for market orders, exact limit price for limits.
-  const quote = refPrice ?? mk * (1 + (o.side === "buy" ? 0.0003 : -0.0003));
+  const quote = refPrice ?? mk * (1 + (o.side === "buy" ? OLP_HALF_SPREAD : -OLP_HALF_SPREAD));
   if (o.max_slippage !== null && Math.abs(quote - mk) / mk > Number(o.max_slippage)) return reject(o, "slippage_exceeded");
   if (!o.reduce_only) {
     const v = accountView(a);
@@ -175,7 +179,10 @@ function processTriggers(a: Acct) {
     const mk = mark(m);
     if (o.status === "open" && o.type === "limit") {
       const px = Number(o.price);
-      if ((o.side === "buy" && mk <= px) || (o.side === "sell" && mk >= px)) execute(a, o, px);
+      // All-or-nothing: fills when OLP's quote crosses the limit, at the quote (limit or better).
+      const ask = mk * (1 + OLP_HALF_SPREAD), bid = mk * (1 - OLP_HALF_SPREAD);
+      if (o.side === "buy" && ask <= px) execute(a, o, ask);
+      else if (o.side === "sell" && bid >= px) execute(a, o, bid);
     } else if (o.status === "untriggered") {
       const tp = Number(o.trigger_price);
       // A sell TP triggers above, a sell SL below (and mirrored for buys).
@@ -380,7 +387,13 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   a.spent = a.spent.filter((x) => now - x.t < 60_000);
   const w = weightOf(method, url.pathname);
   const used = a.spent.reduce((s, x) => s + x.w, 0);
+  if (a.bannedUntil > now) return fail(E(429, "banned", "temporarily banned for repeated rate-limit violations", { retry_after_ms: a.bannedUntil - now }), a);
   if (used + w > WEIGHT_LIMIT) {
+    // Omni's strike system: warnings for strikes 1-4, then escalating bans.
+    a.strikes++;
+    const ban = [0, 0, 0, 0, 0, 15, 30, 60, 300, 3600, 10800][a.strikes] ?? 86400;
+    if (ban) a.bannedUntil = now + ban * 1000;
+    console.error(`[mock] 429 strike ${a.strikes} for ${key.slice(0, 10)}…${ban ? ` → ${ban}s ban` : ""}`);
     const retry = a.spent[0].t + 60_000 - now;
     return fail(E(429, "rate_limited", "rate limit exceeded", { retry_after_ms: retry }), a);
   }

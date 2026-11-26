@@ -34,7 +34,11 @@ export interface OmniClientOptions {
   environment?: "testnet" | "prod" | string;
   /** Override base URL (e.g. the local mock: http://localhost:8787). Defaults to env OMNI_BASE_URL. */
   baseUrl?: string;
-  /** Keep this many weight units in reserve; requests wait for the window rather than dip below it. */
+  /**
+   * Weight to keep unspent. Before each request the client predicts its cost (learned per endpoint
+   * from X-RateLimit-Remaining) and waits for the sliding window rather than risk a 429.
+   * Omni escalates repeated 429s into bans (15s up to 24h), so the default is cautious.
+   */
   reserve?: number;
   maxRetries?: number;
   fetch?: typeof fetch;
@@ -61,6 +65,12 @@ export class OmniClient {
   budget: RateBudget = { limit: null, remaining: null, resetAt: null, updatedAt: 0 };
   /** serverTime - localTime, learned from timestamp errors and Date headers. */
   clockOffsetMs = 0;
+  /** Learned weight cost per endpoint, e.g. "GET /v1/orders/:id" -> 1. */
+  readonly costs = new Map<string, number>();
+  /** 429 responses received by this client (each one is a strike on Omni). */
+  rateLimitHits = 0;
+  /** Our own spend in the last 60s: lets us predict when weight returns to the window. */
+  private ledger: { t: number; w: number }[] = [];
 
   private readonly fetchImpl: typeof fetch;
   private readonly opts: OmniClientOptions;
@@ -196,15 +206,46 @@ export class OmniClient {
     return p;
   }
 
-  private async waitForBudget() {
+  /** "GET /v1/orders/3f2a…" -> "GET /v1/orders/:id" */
+  static routeKey(method: string, path: string) {
+    const p = path.split("?")[0].replace(/^\/v1\/(orders|instruments|tickers|positions)\/(?!history$|batch$)[^/]+$/, "/v1/$1/:id");
+    return `${method.toUpperCase()} ${p}`;
+  }
+
+  /** Predicted cost of a request: the largest cost seen for that endpoint, or 3 until we know. */
+  expectedCost(method: string, path: string) {
+    return this.costs.get(OmniClient.routeKey(method, path)) ?? 3;
+  }
+
+  /** Weight we expect to have right now: last reported remaining plus our spend that has since aged out. */
+  estimatedRemaining(now = Date.now()) {
     const b = this.budget;
-    const reserve = this.opts.reserve ?? 0;
-    if (b.remaining === null || b.resetAt === null) return;
-    if (b.remaining > reserve) return;
-    const wait = b.resetAt - Date.now();
-    if (wait > 0) await sleep(Math.min(wait, 60_000));
-    // The window slides, so assume weight came back; the next response corrects us.
-    this.budget = { ...b, remaining: b.limit };
+    if (b.remaining === null || b.limit === null) return null;
+    const back = this.ledger.filter((x) => x.t + 60_000 > b.updatedAt && x.t + 60_000 <= now).reduce((s, x) => s + x.w, 0);
+    return Math.min(b.limit, b.remaining + back);
+  }
+
+  private async waitForBudget(cost: number) {
+    const reserve = this.opts.reserve ?? 3;
+    const b = this.budget;
+    for (;;) {
+      const now = Date.now();
+      this.ledger = this.ledger.filter((x) => x.t + 60_000 > now - 1000);
+      const est = this.estimatedRemaining(now);
+      if (est === null || est - cost >= reserve) return;
+      // Sleep until enough of our own spend ages out of the window (or the reported full reset).
+      let need = cost + reserve - est, wakeAt = b.resetAt ?? now + 5000;
+      for (const x of this.ledger) {
+        if (x.t + 60_000 <= now) continue;
+        need -= x.w;
+        if (need <= 0) { wakeAt = Math.min(wakeAt, x.t + 60_000); break; }
+      }
+      await sleep(Math.max(50, Math.min(wakeAt - now + 50, 60_000)));
+      if (Date.now() >= (b.resetAt ?? Infinity)) {
+        this.budget = { ...this.budget, remaining: this.budget.limit, updatedAt: Date.now() };
+        return;
+      }
+    }
   }
 
   private async send<T>(method: string, path: string, query?: Query, body?: unknown): Promise<T> {
@@ -221,7 +262,10 @@ export class OmniClient {
     let unknownKeyRetries = 0;
 
     for (let attempt = 0; ; attempt++) {
-      await this.waitForBudget();
+      const key = OmniClient.routeKey(method, path);
+      const expected = this.expectedCost(method, path);
+      await this.waitForBudget(expected);
+      const prev = this.budget;
       const ts = Date.now() + this.clockOffsetMs;
       const headers: Record<string, string> = { ...this.signer.sign(method, pathAndQuery, bodyStr, ts) };
       if (bodyStr) headers["content-type"] = "application/json";
@@ -232,6 +276,17 @@ export class OmniClient {
         body: bodyStr || undefined,
       });
       this.readBudget(res.headers);
+      // Learn this endpoint's cost from the drop in reported remaining. It is exact only when none of
+      // our earlier spend aged out of the window in between, so only learn then. The ledger records
+      // the exact cost or, failing that, the minimum (1): under-counting past spend keeps the
+      // remaining-weight estimate pessimistic, which is the safe direction for avoiding 429s.
+      const now = Date.now();
+      const aged = this.ledger.some((x) => x.t + 60_000 > prev.updatedAt - 1000 && x.t + 60_000 <= now + 1000);
+      const after = this.budget.remaining;
+      const exact = prev.remaining !== null && after !== null && res.status !== 429 && !aged ? prev.remaining - after : null;
+      if (exact !== null && exact > 0 && exact <= 20) this.costs.set(key, exact);
+      this.ledger.push({ t: now, w: exact !== null && exact > 0 ? exact : 1 });
+      if (res.status === 429) this.rateLimitHits++;
       this.opts.onRequest?.({ method, path: pathAndQuery, status: res.status, ms: Date.now() - t0 });
       const text = await res.text();
       let json: any = undefined;
@@ -250,7 +305,7 @@ export class OmniClient {
 
       const retryable =
         err.error_code === "timestamp_out_of_window" ||
-        err.error_code === "rate_limited" ||
+        (err.error_code === "rate_limited" && attempt === 0) || // one careful retry; more 429s mean more strikes
         err.error_code === "overloaded" ||
         err.error_code === "service_unavailable" ||
         (err.error_code === "unknown_key" && unknownKeyRetries++ < 3); // new keys take a few seconds
