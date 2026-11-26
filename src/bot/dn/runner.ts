@@ -143,7 +143,7 @@ interface Trade {
   devAtEntry: number;
   carryBpsDay: number;
 }
-interface State { stats: any; trade: Trade | null; realizedUsd: number; trades: number }
+interface State { stats: any; trade: Trade | null; realizedUsd: number; trades: number; paused: string | null }
 
 const SP: SignalParams = {
   entryZ: +a["entry-z"]!, exitZ: +a["exit-z"]!, roundTripBps: +a["round-trip-bps"]!, minEdgeBps: +a["min-edge-bps"]!,
@@ -289,17 +289,21 @@ async function exit(why: string, pm: number, sm: number, swapOpen: boolean) {
   log("exit", { why, pnl, heldMin: (Date.now() - t.openedAt) / 60000 });
   state.trade = null;
   save();
-  // Carry mode is a single hold: after any exit, stay flat. Stat mode keeps trading after a normal
-  // reversion exit, but a manual or safety exit (stop loss, liquidation distance, max hold, swap
-  // closing) stops it too, so it can't walk straight back into the same loss.
+  // The bot never stops itself. After a manual or safety exit (stop loss, liquidation distance, max
+  // hold, swap closing) it keeps running flat with new entries paused, so it can't walk straight back
+  // into the same loss; "Resume entries" (cmd file "resume") turns them back on. Stat mode's normal
+  // spread-reversion exits don't pause it.
+  exitRequested = false;
   const routine = a.mode === "stat" && why.startsWith("spread reverted");
   if (!routine) {
-    say(`stopping after this exit (${a.mode === "carry" ? "carry mode holds once" : "manual/safety exit"}); start the bot again to re-enter`);
-    halt = true;
+    state.paused = why;
+    say(`entries paused after this exit (${why}); the bot keeps running. Resume entries to trade again.`);
+    save();
   }
 }
-let halt = false;
 let exitRequested = false;
+let blocked: string | null = null; // why the bot can't trade right now (it keeps checking)
+let snap: Record<string, unknown> = {};
 
 let cycleN = 0;
 let lastFunding: { perp: number; swap: number; at: number } | null = null;
@@ -319,6 +323,10 @@ async function cycle() {
   const t = state.trade;
   const sig = signal(stats, x, SP, F, t?.dir ?? null);
   const minsToClose = si.next_close_at ? (si.next_close_at - Date.now()) / 60000 : Infinity;
+  snap = {
+    pm, sm, devBps: +sig.devBps.toFixed(2), z: +sig.z.toFixed(3), stdBps: +stats.stdBps().toFixed(2), n: stats.n, signal: sig.reason,
+    swapStatus: swapOpen ? "open" : si.status, minsToClose: Number.isFinite(minsToClose) ? Math.round(minsToClose) : null,
+  };
 
   // ---------- safety while open ----------
   if (t && LIVE && cycleN % 3 === 0) {
@@ -349,8 +357,10 @@ async function cycle() {
   const cmdPath = statePath.replace(/\.json$/, ".cmd");
   if (existsSync(cmdPath)) {
     const c = readFileSync(cmdPath, "utf8").trim();
-    unlinkSync(cmdPath);
+    if (c === "exit" || c === "resume" || c === "forget-trade") unlinkSync(cmdPath);
+    if (c === "forget-trade") say("ignoring forget-trade: positions match the saved trade, so there is nothing to forget");
     if (c === "exit" && t) exitRequested = true;
+    if (c === "resume") { state.paused = null; say("entries resumed"); save(); }
   }
   // Sticky: if the exit is deferred (e.g. waiting for rate-limit weight), keep trying every cycle.
   if (exitRequested && t) return exit("manual exit requested", pm, sm, swapOpen);
@@ -363,7 +373,7 @@ async function cycle() {
   }
 
   // ---------- entry ----------
-  if (!t) {
+  if (!t && !state.paused) {
     const canEnter = swapOpen && swapFresh && minsToClose > +a["flat-before-close-min"]! * 2;
     if (a.mode === "carry") {
       const dir = a.dir as Dir;
@@ -379,66 +389,108 @@ async function cycle() {
   say(`${pair.key} perp ${pm} swap ${sm} | dev ${sig.devBps >= 0 ? "+" : ""}${sig.devBps.toFixed(1)}bp z ${sig.z.toFixed(2)} σ ${stats.stdBps().toFixed(1)}bp n${stats.n} | ` +
     (tr ? `OPEN ${tr.dir} pnl ${legsPnl(tr, pm, sm).toFixed(2)}$ ` : `${sig.reason} `) +
     `| swap ${swapOpen ? "open" : si.status}${Number.isFinite(minsToClose) ? `, closes in ${(minsToClose / 60).toFixed(1)}h` : ""} | w ${client.budget.remaining}/${client.budget.limit}`);
-  if (a["status-json"]) {
-    console.log("@@" + JSON.stringify({
-      t: Date.now(), pair: pair.key, perp: pair.perp.symbol, swap: pair.swap.symbol, pm, sm, mode: a.mode, live: LIVE,
-      devBps: +sig.devBps.toFixed(2), z: +sig.z.toFixed(3), stdBps: +stats.stdBps().toFixed(2), n: stats.n, signal: sig.reason,
-      swapStatus: swapOpen ? "open" : si.status, minsToClose: Number.isFinite(minsToClose) ? Math.round(minsToClose) : null,
-      trade: tr ? { ...tr, pnl: +legsPnl(tr, pm, sm).toFixed(4) } : null,
-      realizedUsd: state.realizedUsd, trades: state.trades, funding: lastFunding, liq: lastLiq, exitPending: exitRequested,
-      weight: client.budget.remaining, limit: client.budget.limit,
-    }));
-  }
   if (cycleN % 6 === 0) save();
 }
 
-async function run() {
-  if (!a.pair) throw new Error("--pair is required (run `scan` to list pairs)");
-  if (a.mode === "carry" && a.dir !== "short_perp" && a.dir !== "long_perp") throw new Error("carry mode needs --dir short_perp|long_perp");
-  if (LIVE && client.environment === "prod" && process.env.OMNI_ALLOW_PROD !== "1") throw new Error("mainnet needs OMNI_ALLOW_PROD=1");
-  const pairs = discoverPairs(await client.instruments());
-  const found = pairs.find((p) => p.key === a.pair!.toUpperCase() || p.perp.symbol === a.pair!.toUpperCase() || p.swap.symbol === a.pair!.toUpperCase());
-  if (!found) throw new Error(`no perp/swap pair "${a.pair}". Available: ${pairs.map((p) => p.key).join(", ") || "none"}`);
-  pair = found;
-  // Guard against a mis-paired hedge (e.g. a token that shares a ticker with an index).
-  {
+/** Machine-readable status for the web panel, emitted every cycle (including blocked/early cycles). */
+function emitStatus() {
+  if (!a["status-json"]) return;
+  const tr = state?.trade ?? null;
+  const pm = Number(snap.pm), sm = Number(snap.sm);
+  console.log("@@" + JSON.stringify({
+    t: Date.now(), pair: pair?.key ?? a.pair, perp: pair?.perp.symbol, swap: pair?.swap.symbol, mode: a.mode, live: LIVE, ...snap,
+    trade: tr ? { ...tr, pnl: pm && sm ? +legsPnl(tr, pm, sm).toFixed(4) : null } : null,
+    realizedUsd: state?.realizedUsd ?? 0, trades: state?.trades ?? 0, funding: lastFunding, liq: lastLiq,
+    exitPending: exitRequested, paused: state?.paused ?? null, blocked,
+    weight: client.budget.remaining, limit: client.budget.limit,
+  }));
+}
+
+/** Config errors can't fix themselves: exit with code 2 so the panel doesn't restart-loop. */
+function configError(msg: string): never {
+  console.error(msg);
+  process.exit(2);
+}
+
+/** Startup checks that depend on the exchange; returns a reason to wait, or null when ready. */
+async function prepare(): Promise<string | null> {
+  if (!pair) {
+    const pairs = discoverPairs(await client.instruments());
+    const found = pairs.find((p) => p.key === a.pair!.toUpperCase() || p.perp.symbol === a.pair!.toUpperCase() || p.swap.symbol === a.pair!.toUpperCase());
+    if (!found) return `no perp/swap pair "${a.pair}" right now (available: ${pairs.map((p) => p.key).join(", ") || "none"})`;
+    // Guard against a mis-paired hedge (e.g. a token that shares a ticker with an index).
     const tk = new Map((await client.tickers()).map((t) => [t.symbol, Number(t.mark_price)]));
-    const ratio = (tk.get(pair.perp.symbol) ?? NaN) / (tk.get(pair.swap.symbol) ?? NaN);
-    if (!(ratio > 0.02 && ratio < 50)) throw new Error(`${pair.perp.symbol} and ${pair.swap.symbol} trade at a ${ratio.toPrecision(3)} price ratio: probably not the same asset. Run \`scan\` and check the CORR column.`);
+    const ratio = (tk.get(found.perp.symbol) ?? NaN) / (tk.get(found.swap.symbol) ?? NaN);
+    if (!(ratio > 0.02 && ratio < 50)) configError(`${found.perp.symbol} and ${found.swap.symbol} trade at a ${ratio.toPrecision(3)} price ratio: probably not the same asset. Run \`scan\` and check the CORR column.`);
+    pair = found;
+    statePath = a.state ?? `dn-${pair.key}${LIVE ? "" : "-dry"}.json`;
+    const saved = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;
+    state = {
+      stats: SpreadStats.from(saved?.stats, +a["half-life-min"]! * 60), trade: saved?.trade ?? null,
+      realizedUsd: saved?.realizedUsd ?? 0, trades: saved?.trades ?? 0, paused: saved?.paused ?? null,
+    };
+    say(`DN ${pair.key}: perp ${pair.perp.symbol} ⇄ swap ${pair.swap.symbol} · mode ${a.mode}${a.mode === "carry" ? ` ${a.dir}` : ""} · ${a["notional-usd"]}$/leg · ` +
+      `entry |z|≥${SP.entryZ} exit |z|≤${SP.exitZ} · costs ${SP.roundTripBps}bp · state ${statePath}${LIVE ? "" : " · DRY RUN (paper fills; --live to trade)"}`);
+    if (saved?.stats?.n) say(`resumed spread stats (${saved.stats.n} samples)${state.trade ? ` and an OPEN ${state.trade.dir} trade` : ""}`);
+    if (state.paused) say(`entries are paused (${state.paused}); Resume entries to trade again`);
   }
-  statePath = a.state ?? `dn-${pair.key}${LIVE ? "" : "-dry"}.json`;
-  const halfLife = +a["half-life-min"]! * 60;
-  const saved = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;
-  state = { stats: SpreadStats.from(saved?.stats, halfLife), trade: saved?.trade ?? null, realizedUsd: saved?.realizedUsd ?? 0, trades: saved?.trades ?? 0 };
-  say(`DN ${pair.key}: perp ${pair.perp.symbol} ⇄ swap ${pair.swap.symbol} · mode ${a.mode}${a.mode === "carry" ? ` ${a.dir}` : ""} · ${a["notional-usd"]}$/leg · ` +
-    `entry |z|≥${SP.entryZ} exit |z|≤${SP.exitZ} · costs ${SP.roundTripBps}bp · state ${statePath}${LIVE ? "" : " · DRY RUN (paper fills; --live to trade)"}`);
-  if (saved?.stats?.n) say(`resumed spread stats (${saved.stats.n} samples)${state.trade ? ` and an OPEN ${state.trade.dir} trade` : ""}`);
+  // Commands can arrive while blocked, e.g. "forget-trade" after you fixed positions by hand.
+  const cmdPath = statePath.replace(/\.json$/, ".cmd");
+  if (existsSync(cmdPath) && readFileSync(cmdPath, "utf8").trim() === "forget-trade") {
+    unlinkSync(cmdPath);
+    if (state.trade) { say("forgetting the saved trade at your request (positions on Omni are left as they are)"); log("forget_trade", { trade: state.trade }); }
+    state.trade = null;
+    state.paused = "you told the bot to forget its saved trade";
+    save();
+  }
   if (state.trade && LIVE) {
     const [pp, ps] = [await client.position(pair.perp.symbol), await client.position(pair.swap.symbol)];
-    say(`exchange positions: perp ${pp.size}, swap ${ps.size} (state expects perp ${state.trade.perp.size}, swap ${state.trade.swap.size})`);
     // The bot only owns what it opened. If the account holds less than that (a leg closed by hand, a
-    // liquidation), managing it blindly could open an unhedged position: stop and let a human decide.
+    // liquidation), managing it blindly could open an unhedged position: wait for a human.
     const short = (have: number, want: number) => Math.sign(have) !== Math.sign(want) || Math.abs(have) < Math.abs(want) * 0.99;
-    if (short(Number(pp.size), state.trade.perp.size) || short(Number(ps.size), state.trade.swap.size)) {
-      throw new Error(`positions don't match ${statePath}: fix them on Omni, then delete the "trade" entry from that file (or the file) and restart`);
-    }
+    if (short(Number(pp.size), state.trade.perp.size) || short(Number(ps.size), state.trade.swap.size))
+      return `exchange positions (perp ${pp.size}, swap ${ps.size}) don't match the saved trade (perp ${state.trade.perp.size}, swap ${state.trade.swap.size}). ` +
+        `Fix them on Omni, then use "Forget saved trade".`;
+    say(`exchange positions match the saved trade (perp ${pp.size}, swap ${ps.size})`);
   }
+  return null;
+}
+
+async function run() {
+  if (!a.pair) configError("--pair is required (run `scan` to list pairs)");
+  if (a.mode === "carry" && a.dir !== "short_perp" && a.dir !== "long_perp") configError("carry mode needs --dir short_perp|long_perp");
+  if (LIVE && client.environment === "prod" && process.env.OMNI_ALLOW_PROD !== "1") configError("mainnet needs OMNI_ALLOW_PROD=1");
 
   let stopping = false, current: Promise<unknown> = Promise.resolve();
   const stop = async () => {
     if (stopping) process.exit(1);
     stopping = true;
     await current;
-    save();
-    say(state.trade ? `stopped with an OPEN ${state.trade.dir} position: it stays on (delta-neutral). Re-run to resume managing it.` : "stopped; flat");
+    if (state) save();
+    say(state?.trade ? `stopped with an OPEN ${state.trade.dir} position: it stays on (delta-neutral). Re-run to resume managing it.` : "stopped; flat");
     process.exit(0);
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+  // Never die on a stray error: log it and keep going (the panel also restarts a bot that exits).
+  process.on("uncaughtException", (e) => say(`unexpected error (continuing): ${e?.stack ?? e}`));
+  process.on("unhandledRejection", (e) => say(`unexpected rejection (continuing): ${(e as Error)?.stack ?? e}`));
+
+  // Startup: retry until the exchange is reachable and positions check out; never exit on its own.
+  for (let attempt = 0; !stopping; attempt++) {
+    current = prepare().then((r) => r, (e) => `startup check failed: ${e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : (e as Error).message}`);
+    const r = (await current) as string | null;
+    if (r !== blocked) { if (r) say(`waiting: ${r} (rechecking every 30s)`); else if (blocked) say("unblocked; starting"); }
+    blocked = r;
+    emitStatus();
+    if (!r) break;
+    await sleep(30_000);
+  }
+
   for (;;) {
-    if (halt) return stop();
     current = cycle().catch((e) => say(`error: ${e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : (e as Error).message}`));
     await current;
+    emitStatus();
     cycleN++;
     // Polling only spends weight above the trading reserve, so a two-leg trade can always go out
     // the moment a signal fires. Below it, wait for the sliding window to hand weight back.

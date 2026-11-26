@@ -4,3 +4,5 @@ dist/
 dn-*.json
 dn-*.jsonl
 mm-*.jsonl
+web-bots.json
+dn-*.cmd

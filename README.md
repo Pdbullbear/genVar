@@ -94,9 +94,10 @@ The terminal prints a link like `http://127.0.0.1:8790/?t=…`. Open it in your 
   fill slippage, the swap market's hours, liquidation prices, live charts and the log.
   The header shows the API weight left.
 - **Act:**
-  - **Stop** stops the bot and leaves a hedged position open; Start again resumes it.
+  - **Stop** is the only thing that stops a bot. An open position stays on, hedged; Start again resumes it.
   - **Exit position** closes both legs together. If rate-limit weight is short, the exit waits and
-    retries; the bot then stops.
+    retries. Afterwards the bot keeps running, flat, with new entries paused.
+  - **Resume entries** lets a paused bot trade again.
 - **Pairs, positions and scans** are on the same page.
 
 Safety:
@@ -107,11 +108,20 @@ Safety:
 The panel and its bots share your key's 60 weight per minute. The bots get priority, so the account
 numbers can take a few seconds to appear.
 
-Bots run inside the panel, so keep it running (e.g. in `tmux`) for as long as they should trade.
-Ctrl-C stops them gracefully, and any open position stays on, hedged.
-
-A carry bot holds once: after any exit it stops, and won't re-enter until you start it again.
-A spread bot keeps trading after normal spread-reversion exits, but stops after a manual or safety exit.
+**Bots only stop when you press Stop:**
+- **Crashes:** if a bot process dies for any other reason, the panel restarts it after 5s, then 10s,
+  20s and so on, up to 5 minutes. It resumes any open trade after checking it against the exchange.
+- **Panel restarts:** the bots you left running are saved in `web-bots.json` and come back when the
+  panel starts again. Keep the panel itself running, e.g. in `tmux`. Ctrl-C stops the panel and its
+  bots, leaving any open position on, hedged.
+- **Exits:** after a manual or safety exit (stop loss, liquidation distance, max hold, swap closing),
+  the bot keeps running but pauses new entries, so it can't walk straight back into the same loss.
+  Press **Resume entries** to trade again. A stat bot's normal spread-reversion exits don't pause it.
+- **Problems the bot can't fix:** exchange unreachable at startup, or positions that don't match the
+  saved trade. The bot keeps running in a visible *waiting* state and rechecks every 30s. For a
+  mismatch, fix the positions on Omni and press **Forget saved trade**; entries stay paused afterwards.
+- **Configuration errors** (an unknown pair, legs that aren't the same asset) are the only case the
+  panel doesn't retry, because retrying can't fix them. The card shows the error.
 
 ## Delta-neutral swap ⇄ perp bot
 

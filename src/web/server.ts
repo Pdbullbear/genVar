@@ -66,8 +66,18 @@ async function pairs() {
 interface Bot {
   pair: string; live: boolean; cfg: any; args: string[]; proc: ChildProcess | null; startedAt: number; exitedAt?: number;
   exitCode?: number | null; log: string[]; status: any; series: { t: number; dev: number; pnl: number | null }[];
+  /** You want it running: only your Stop clears this. A bot that exits while wanted is restarted. */
+  wanted: boolean; restarts: number; restartAt?: number; restartTimer?: NodeJS.Timeout; fatal?: string;
 }
 const bots = new Map<string, Bot>(); // key: PAIR or PAIR-dry
+
+// Which bots you want running survives panel restarts: they come back when the panel starts.
+const REGISTRY = join(ROOT, "web-bots.json");
+function saveRegistry() {
+  const list = [...bots.entries()].map(([key, b]) => ({ key, cfg: b.cfg, wanted: b.wanted }));
+  try { writeFileSync(REGISTRY, JSON.stringify(list, null, 2)); } catch { /* ignore */ }
+}
+let panelStopping = false;
 
 function botKey(pair: string, live: boolean) { return live ? pair : `${pair}-dry`; }
 
@@ -78,6 +88,7 @@ function startBot(cfg: any) {
   const key = botKey(pair, live);
   const existing = bots.get(key);
   if (existing?.proc) throw new Error(`${key} bot is already running`);
+  if (existing?.restartTimer) clearTimeout(existing.restartTimer);
   const num = (k: string, v: unknown) => {
     if (v === undefined || v === null || v === "") return [];
     const n = Number(v);
@@ -94,8 +105,12 @@ function startBot(cfg: any) {
     ...num("round-trip-bps", cfg.roundTripBps), ...num("poll", cfg.poll),
     ...(live ? ["--live"] : [])];
   const proc = spawn(process.execPath, args, { cwd: ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-  const bot: Bot = { pair, live, cfg, args: args.slice(1), proc, startedAt: Date.now(), log: [], status: existing?.status ?? null, series: existing?.series ?? [] };
+  const bot: Bot = {
+    pair, live, cfg, args: args.slice(1), proc, startedAt: Date.now(), log: existing?.log.slice(-40) ?? [],
+    status: existing?.status ?? null, series: existing?.series ?? [], wanted: true, restarts: existing?.restarts ?? 0,
+  };
   bots.set(key, bot);
+  saveRegistry();
   const onLine = (line: string) => {
     if (!line.trim()) return;
     if (line.startsWith("@@")) {
@@ -113,14 +128,45 @@ function startBot(cfg: any) {
   const feed = (d: Buffer) => { buf += d.toString(); const parts = buf.split("\n"); buf = parts.pop()!; parts.forEach(onLine); };
   proc.stdout!.on("data", feed);
   proc.stderr!.on("data", feed);
-  proc.on("exit", (code) => { bot.proc = null; bot.exitedAt = Date.now(); bot.exitCode = code; onLine(`— bot exited (${code}) —`); });
+  proc.on("exit", (code, signal) => {
+    bot.proc = null; bot.exitedAt = Date.now(); bot.exitCode = code;
+    onLine(`— bot exited (${code ?? signal}) —`);
+    if (panelStopping || !bot.wanted) return;
+    if (code === 2) {
+      // Config error (bad pair, mismatched legs, …): restarting can't fix it.
+      bot.wanted = false;
+      bot.fatal = bot.log.filter((l) => !l.startsWith("—")).slice(-1)[0] ?? "configuration error";
+      saveRegistry();
+      return;
+    }
+    // You didn't stop it, so bring it back. Back off if it keeps dying; reset after a healthy run.
+    if (Date.now() - bot.startedAt > 10 * 60_000) bot.restarts = 0;
+    const delay = Math.min(300, 5 * 2 ** bot.restarts) * 1000;
+    bot.restarts++;
+    bot.restartAt = Date.now() + delay;
+    onLine(`— restarting in ${delay / 1000}s (restart #${bot.restarts}) —`);
+    bot.restartTimer = setTimeout(() => {
+      bot.restartAt = undefined;
+      if (bot.wanted && !bot.proc && !panelStopping) try { startBot(bot.cfg); } catch (e) { onLine(`— restart failed: ${(e as Error).message} —`); }
+    }, delay);
+  });
   return key;
 }
 
 function stopBot(key: string) {
   const b = bots.get(key);
-  if (!b?.proc) throw new Error(`${key} is not running`);
-  b.proc.kill("SIGINT"); // graceful: finishes the cycle, saves state, leaves a hedged position on
+  if (!b) throw new Error(`unknown bot ${key}`);
+  b.wanted = false; // only you can stop a bot
+  if (b.restartTimer) clearTimeout(b.restartTimer);
+  b.restartAt = undefined;
+  saveRegistry();
+  b.proc?.kill("SIGINT"); // graceful: finishes the cycle, saves state, leaves a hedged position on
+}
+
+function sendCmd(key: string, cmd: "exit" | "resume" | "forget-trade") {
+  const b = bots.get(key);
+  if (!b?.proc) throw new Error(`${key} is not running: start it first`);
+  writeFileSync(stateFile(b.pair, b.live).replace(/\.json$/, ".cmd"), cmd);
 }
 
 function stateFile(pair: string, live: boolean) { return join(ROOT, `dn-${pair}${live ? "" : "-dry"}.json`); }
@@ -208,7 +254,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && p === "/api/pairs") return json(res, 200, await pairs());
     if (req.method === "GET" && p === "/api/bots") {
       const list = [...bots.entries()].map(([key, b]) => ({
-        key, pair: b.pair, live: b.live, cfg: b.cfg, running: !!b.proc, startedAt: b.startedAt, exitedAt: b.exitedAt, exitCode: b.exitCode,
+        key, pair: b.pair, live: b.live, cfg: b.cfg, wanted: b.wanted, restarts: b.restarts, restartAt: b.restartAt ?? null, fatal: b.fatal ?? null, running: !!b.proc, startedAt: b.startedAt, exitedAt: b.exitedAt, exitCode: b.exitCode,
         args: b.args.slice(2).join(" "), status: b.status, series: b.series, log: b.log.slice(-80), events: recentEvents(b.pair, b.live, 40),
       }));
       return json(res, 200, { bots: list, saved: savedStates() });
@@ -221,10 +267,13 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && p === "/api/bots/stop") return (stopBot(String((await body(req)).key)), json(res, 200, { ok: true }));
     if (req.method === "POST" && p === "/api/bots/exit") return (requestExit(String((await body(req)).key)), json(res, 200, { ok: true }));
+    if (req.method === "POST" && p === "/api/bots/resume") return (sendCmd(String((await body(req)).key), "resume"), json(res, 200, { ok: true }));
+    if (req.method === "POST" && p === "/api/bots/forget-trade") return (sendCmd(String((await body(req)).key), "forget-trade"), json(res, 200, { ok: true }));
     if (req.method === "POST" && p === "/api/bots/forget") {
       const k = String((await body(req)).key);
-      if (bots.get(k)?.proc) throw new Error("stop it first");
+      if (bots.get(k)?.proc || bots.get(k)?.wanted) throw new Error("stop it first");
       bots.delete(k);
+      saveRegistry();
       return json(res, 200, { ok: true });
     }
     if (req.method === "POST" && p === "/api/carry") {
@@ -243,11 +292,19 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  if (existsSync(REGISTRY)) {
+    try {
+      for (const r of JSON.parse(readFileSync(REGISTRY, "utf8"))) {
+        if (r.wanted) { try { startBot(r.cfg); console.log(`resumed bot ${r.key}`); } catch (e) { console.log(`couldn't resume ${r.key}: ${(e as Error).message}`); } }
+      }
+    } catch { /* ignore a corrupt registry */ }
+  }
   console.log(`omni-kit panel (${client.environment}, key ${client.publicKey.slice(0, 10)}…)`);
   console.log(`\n  open:  http://127.0.0.1:${PORT}/?t=${TOKEN}\n`);
   console.log("Ctrl-C stops the panel and its bots (open DN positions stay on, hedged).");
 });
 const shutdown = () => {
+  panelStopping = true; // bots stop with the panel but stay "wanted", so they resume on the next start
   for (const b of bots.values()) b.proc?.kill("SIGINT");
   scan?.proc?.kill("SIGINT");
   setTimeout(() => process.exit(0), 4000).unref();

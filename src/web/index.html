@@ -342,6 +342,8 @@ async function loadBots() {
     const { bots, saved } = await api("/api/bots");
     for (const b of bots) if (!b.running || !b.status?.trade) exitClicked.delete(b.key);
     $("#sBots").textContent = bots.filter((b) => b.running).length;
+    const crashed = bots.filter((b) => b.wanted && !b.running).length;
+    if (crashed) $("#sBots").innerHTML += ` <span class="neg" style="font-size:13px">(${crashed} restarting)</span>`;
     const real = bots.reduce((s, b) => s + (b.status?.realizedUsd ?? 0), 0);
     $("#sReal").innerHTML = bots.length ? signed(real) : "–";
     if (!bots.length) $("#bots").innerHTML = `<div class="empty">No bots yet. Pick a pair and start one →</div>`;
@@ -351,18 +353,29 @@ async function loadBots() {
       const fills = (b.events || []).filter((e) => e.type === "fill");
       const slip = fills.length ? fills.reduce((x, e) => x + e.slippageBps, 0) / fills.length : null;
       const dir = t ? t.dir : b.cfg?.mode === "carry" ? b.cfg.dir : null;
+      // A "stale" trade means the card is showing the last status from before the process ended.
+      const state = b.running ? (s.blocked ? "running · waiting" : "running · " + ago(b.startedAt).replace(" ago", "")) + (b.restarts ? ` · restarted ${b.restarts}×` : "")
+        : b.restartAt ? `crashed · restarting in ${Math.max(0, Math.round((b.restartAt - Date.now()) / 1000))}s`
+        : b.fatal ? "stopped: configuration error" : b.wanted ? "starting…" : "stopped by you " + ago(b.exitedAt);
+      const banners = [
+        b.fatal ? `<div class="err">${esc(b.fatal)}</div>` : "",
+        b.running && s.blocked ? `<div class="note">Waiting: ${esc(s.blocked)}${/don't match/.test(s.blocked) ? ` <button class="small" data-act="forget-trade" data-k="${esc(b.key)}">Forget saved trade</button>` : ""}</div>` : "",
+        b.running && s.paused && !t ? `<div class="note">New entries paused after: ${esc(s.paused)}. The bot keeps running and watching. <button class="small" data-act="resume" data-k="${esc(b.key)}">Resume entries</button></div>` : "",
+        !b.running && t ? `<div class="note">Not managed right now: the position below is what the bot last saw${b.restartAt ? "; it restarts automatically" : ". Start it again to resume managing it"}.</div>` : "",
+      ].join("");
       return `<div class="bot">
         <div class="top">
           <span class="dot ${b.running ? "on" : ""}"></span><span class="name">${esc(b.pair)}</span>
           <span class="badge ${b.live ? "live" : "dry"}">${b.live ? "live" : "dry run"}</span>
           <span class="badge">${esc(b.cfg?.mode || "?")}${dir ? " · " + esc(dir.replace("_", " ")) : ""}</span>
-          <span class="muted" style="font-size:12px">${b.running ? "running · " + ago(b.startedAt).replace(" ago", "") : "stopped " + ago(b.exitedAt)}</span>
+          <span class="muted" style="font-size:12px">${state}</span>
           <div class="spacer"></div>
           <div class="actions">
-            ${b.running ? `<button class="small" data-act="stop" data-k="${esc(b.key)}" title="Stops the bot; an open position stays on, hedged">Stop</button>` : `<button class="small" data-act="restart" data-k="${esc(b.key)}">Start again</button><button class="small" data-act="forget" data-k="${esc(b.key)}">Remove</button>`}
+            ${b.wanted ? `<button class="small" data-act="stop" data-k="${esc(b.key)}" title="Stops the bot; an open position stays on, hedged">Stop</button>` : `<button class="small" data-act="restart" data-k="${esc(b.key)}">Start again</button>${b.running ? "" : `<button class="small" data-act="forget" data-k="${esc(b.key)}">Remove</button>`}`}
             ${b.running && t ? (s.exitPending || exitClicked.has(b.key) ? `<span class="badge live">exit pending…</span>` : `<button class="small danger" data-act="exit" data-k="${esc(b.key)}">Exit position</button>`) : ""}
           </div>
         </div>
+        ${banners}
         <div class="metrics">
           <div class="metric"><div class="k">Position</div><div class="v">${t ? `${n(Math.abs(t.perp.size) * (s.pm || 0), 0)}$ ×2` : "flat"}</div></div>
           <div class="metric"><div class="k">Legs PnL</div><div class="v">${t ? signed(t.pnl) : "–"}</div></div>
@@ -377,7 +390,7 @@ async function loadBots() {
           <div class="chart"><div class="k"><span>Legs PnL ($)</span><span>${t ? n(t.pnl) : ""}</span></div>${spark(b.series, "pnl", "var(--accent)")}</div>
           <div class="chart"><div class="k"><span>Spread vs mean (bp)</span><span>${n(s.devBps, 1)}</span></div>${spark(b.series, "dev", "var(--amber)")}</div>
         </div>
-        <div class="hint">${b.cfg?.mode === "carry" ? (t ? "Holding for funding: exits only on a safety limit or when you press Exit." : esc(s.signal || "")) : esc(s.signal || "")}</div>
+        <div class="hint">${b.cfg?.mode === "carry" ? (t ? "Holding for funding: exits only on a safety limit or when you press Exit. The bot keeps running until you press Stop." : s.paused ? "" : "Flat: enters when the swap market is open.") : esc(s.signal || "")}</div>
         <details data-log="${esc(b.key)}" ${openLogs.has(b.key) ? "open" : ""}><summary>Log & fills</summary>
           ${fills.length ? `<table style="margin-top:6px"><thead><tr><th>Time</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Slippage</th></tr></thead><tbody>${fills.slice(-8).reverse().map((f) => `<tr><td>${new Date(f.t).toLocaleTimeString()}</td><td>${esc(f.symbol)}</td><td class="${f.side === "buy" ? "pos" : "neg"}">${esc(f.side)}</td><td class="num">${esc(f.size)}</td><td class="num">${px(f.price)}</td><td class="num">${n(f.slippageBps, 1)}bp</td></tr>`).join("")}</tbody></table>` : ""}
           <pre>${esc(b.log.slice(-60).join("\n"))}</pre>
@@ -389,8 +402,10 @@ async function loadBots() {
       const k = btn.dataset.k, act = btn.dataset.act;
       if (act === "exit" && !confirm(`Close both legs of ${k} now (market orders)?`)) return;
       if (act === "restart" && k.indexOf("-dry") < 0 && !confirm(`Start the LIVE ${k} bot again?`)) return;
+      if (act === "stop" && !confirm(`Stop the ${k} bot? It won't restart until you start it again. Any open position stays on (hedged) but unmanaged.`)) return;
+      if (act === "forget-trade" && !confirm("Only do this after fixing the positions on Omni yourself. Forget the bot's saved trade?")) return;
       btn.disabled = true;
-      try { await api(`/api/bots/${act}`, { key: k }); if (act === "exit") exitClicked.add(k); toast(act === "exit" ? "Exit requested: the bot closes both legs on its next cycle" : act === "stop" ? "Stopping…" : "Done"); }
+      try { await api(`/api/bots/${act}`, { key: k }); if (act === "exit") exitClicked.add(k); toast(act === "exit" ? "Exit requested: the bot closes both legs on its next cycle" : act === "stop" ? "Stopping…" : act === "resume" ? "Entries resume on the next cycle" : "Done"); }
       catch (e) { toast(e.message); }
       loadBots();
     });
