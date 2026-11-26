@@ -203,7 +203,8 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
 
   <div class="cols">
     <section class="card">
-      <h2>Exchange positions <span class="right muted" id="posAt"></span></h2>
+      <h2>Exchange positions <span class="right muted" id="posAt"></span><button class="small danger" id="closeAllBtn" title="Close every open position on the account">Close all positions</button></h2>
+      <div id="closeAllOut"></div>
       <div class="scroll"><table id="positions"><thead><tr>
         <th>Market</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">uPnL</th><th class="num">Funding</th><th class="num">Liq.</th><th>Margin</th>
       </tr></thead><tbody></tbody></table></div>
@@ -265,6 +266,7 @@ async function loadOverview() {
       $("#sAvail").textContent = n(a.cross.available); $("#sMargin").textContent = n(a.initial_margin);
     }
     $("#posAt").textContent = o.at ? "updated " + ago(o.at) : "";
+    if (!closeT) $("#closeAllBtn").disabled = !(o.positions || []).length;
     const tb = $("#positions tbody");
     tb.innerHTML = o.positions.length ? o.positions.map((p) => `<tr>
       <td>${esc(p.symbol)}</td><td class="num ${Number(p.size) > 0 ? "pos" : "neg"}">${esc(p.size)}</td>
@@ -452,9 +454,37 @@ function spark(series, key, color, zero = true) {
 
 const openLogs = new Set();
 const exitClicked = new Set(); // show "exit pending" from the click until the bot is flat or stopped
+let BOTS = [];
+
+// ---------- close all positions ----------
+$("#closeAllBtn").onclick = async () => {
+  const managed = BOTS.filter((b) => b.live && b.running && b.status?.trade).map((b) => b.pair);
+  const msg = "Close ALL open positions on this account with market orders?\n\n" +
+    (managed.length ? `• Bots (${managed.join(", ")}) close both of their legs together, then stay running with new entries paused.\n` : "") +
+    `• ${managed.length ? "All other positions are" : "Every position is"} closed with a reduce-only market order (up to 2% slippage).\n` +
+    "• A bot leg that can't close right now (e.g. its swap market is shut) is left alone so you stay hedged.";
+  if (!confirm(msg)) return;
+  try { await api("/api/close-all", { confirm: true }); for (const b of managed) exitClicked.add(b); toast("Closing all positions…"); pollCloseAll(); }
+  catch (e) { toast(e.message); }
+};
+let closeT;
+async function pollCloseAll() {
+  clearTimeout(closeT);
+  const j = await api("/api/close-all").catch(() => null);
+  if (!j) return;
+  const cls = { ok: "pos", warn: "", err: "neg", info: "muted" };
+  $("#closeAllBtn").disabled = j.running;
+  $("#closeAllOut").innerHTML = `<div class="body"><div class="${j.running ? "note" : "calc"}" style="display:grid; gap:4px">
+    <b>${j.running ? "Closing all positions…" : `Close all finished ${ago(j.finishedAt)}`}</b>
+    ${j.steps.map((s) => `<div class="${cls[s.level]}" style="font-size:12.5px">${new Date(s.at).toLocaleTimeString()} · ${esc(s.text)}</div>`).join("")}
+    ${j.running ? "" : `<div><button class="small" id="closeAllDismiss">Dismiss</button></div>`}</div></div>`;
+  const d = $("#closeAllDismiss"); if (d) d.onclick = () => { $("#closeAllOut").innerHTML = ""; };
+  if (j.running) closeT = setTimeout(pollCloseAll, 2000); else loadOverview();
+}
 async function loadBots() {
   try {
     const { bots, saved } = await api("/api/bots");
+    BOTS = bots;
     for (const b of bots) if (!b.running || !b.status?.trade) exitClicked.delete(b.key);
     $("#sBots").textContent = bots.filter((b) => b.running).length;
     const crashed = bots.filter((b) => b.wanted && !b.running).length;
@@ -580,6 +610,7 @@ async function warm() {
   if (!gotOverview || !gotPairs) setTimeout(warm, 3000);
 }
 warm(); loadBots(); calc(); pollScan();
+api("/api/close-all").then((j) => { if (j?.running) pollCloseAll(); }).catch(() => {});
 setInterval(loadBots, 3000);
 setInterval(loadOverview, 20000);
 setInterval(loadPairs, 30000);

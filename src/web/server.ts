@@ -252,6 +252,69 @@ function recentEvents(pair: string, live: boolean, n = 50) {
 }
 
 // ---------- scan jobs ----------
+// ---------- close all positions ----------
+// 1. Every live bot holding a trade gets "exit": it closes both legs together and pauses entries.
+// 2. Once the bots are flat, anything else on the account is closed with reduce-only market orders.
+// 3. Symbols a bot still owns (e.g. its swap market is closed) are left alone and reported: closing
+//    one leg on its own would leave the other unhedged.
+interface CloseStep { at: number; text: string; level: "info" | "ok" | "warn" | "err" }
+type CloseJob = { running: boolean; startedAt: number; finishedAt?: number; steps: CloseStep[] };
+let closeAll: CloseJob | null = null;
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function runCloseAll() {
+  const job: CloseJob = { running: true, startedAt: Date.now(), steps: [] };
+  closeAll = job;
+  const step = (text: string, level: CloseStep["level"] = "info") => job.steps.push({ at: Date.now(), text, level });
+  try {
+    // ---- 1. bot-managed positions ----
+    const holding = [...bots.entries()].filter(([, b]) => b.live && b.proc && b.status?.trade);
+    for (const [key, b] of holding) {
+      writeFileSync(stateFile(b.pair, b.live).replace(/\.json$/, ".cmd"), "exit");
+      step(`${key}: asked the bot to close both legs`);
+    }
+    const deadline = Date.now() + 4 * 60_000;
+    // Wait for the bots, but not for ones whose swap market is closed: they can't exit until it reopens.
+    const canStillClose = ([, b]: [string, Bot]) => b.proc && b.status?.trade && (!b.status.swapStatus || b.status.swapStatus === "open");
+    while (holding.some(canStillClose) && Date.now() < deadline) await sleepMs(2000);
+    const stuck = holding.filter(([, b]) => b.proc && b.status?.trade);
+    for (const [key] of holding) if (!stuck.find(([k]) => k === key)) step(`${key}: bot closed both legs (entries now paused)`, "ok");
+    for (const [key, b] of stuck)
+      step(`${key}: the bot hasn't been able to close yet${b.status?.swapStatus && b.status.swapStatus !== "open" ? ` (${b.pair} swap market is ${b.status.swapStatus})` : ""}. It keeps trying; its legs are left alone here so you stay hedged.`, "warn");
+
+    // Symbols still owned by a running bot with an open trade are not ours to touch.
+    const owned = new Set<string>();
+    for (const [, b] of bots) if (b.proc && b.status?.trade) { owned.add(b.status.perp); owned.add(b.status.swap); }
+
+    // ---- 2. everything else ----
+    const positions = (await client.positions()).filter((p) => Number(p.size) !== 0);
+    const rest = positions.filter((p) => !owned.has(p.symbol));
+    if (!rest.length && positions.length) step("no other positions to close", "ok");
+    for (const p of rest) {
+      const size = Math.abs(Number(p.size));
+      const side = Number(p.size) > 0 ? "sell" : "buy";
+      try {
+        const [o] = await client.placeOrder({ type: "market", symbol: p.symbol, side, size: String(size), max_slippage: "0.02", reduce_only: true });
+        const f = o.status === "queued" ? await client.waitForOrder(o.order_id, { timeoutMs: 20_000, intervalMs: 700 }) : o;
+        if (f.status === "filled") step(`${p.symbol}: closed ${p.size} at ${f.fill_price}`, "ok");
+        else step(`${p.symbol}: order ${f.status}${f.reason ? ` (${f.reason})` : ""}`, "err");
+      } catch (e) {
+        step(`${p.symbol}: ${e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : (e as Error).message}`, "err");
+      }
+    }
+    // ---- 3. final check ----
+    const left = (await client.positions()).filter((p) => Number(p.size) !== 0);
+    if (!left.length) step("done: the account has no open positions", "ok");
+    else step(`still open: ${left.map((p) => `${p.symbol} ${p.size}${owned.has(p.symbol) ? " (bot exit pending)" : ""}`).join(", ")}`, "warn");
+  } catch (e) {
+    step(`stopped: ${e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : (e as Error).message}`, "err");
+  } finally {
+    job.running = false;
+    job.finishedAt = Date.now();
+    await account(true); // refresh the positions table
+  }
+}
+
 let scan: { running: boolean; startedAt: number; minutes: number; result: any; err?: string; proc?: ChildProcess } | null = null;
 function startScan(minutes: number) {
   if (scan?.running) throw new Error("a scan is already running");
@@ -337,6 +400,13 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && p === "/api/bots/stop") return (stopBot(String((await body(req)).key)), json(res, 200, { ok: true }));
     if (req.method === "POST" && p === "/api/bots/exit") return (requestExit(String((await body(req)).key)), json(res, 200, { ok: true }));
     if (req.method === "POST" && p === "/api/bots/resume") return (sendCmd(String((await body(req)).key), "resume"), json(res, 200, { ok: true }));
+    if (req.method === "POST" && p === "/api/close-all") {
+      if ((await body(req)).confirm !== true) throw new Error("confirmation required");
+      if (closeAll?.running) throw new Error("already closing positions");
+      void runCloseAll();
+      return json(res, 200, { ok: true });
+    }
+    if (req.method === "GET" && p === "/api/close-all") return json(res, 200, closeAll);
     if (req.method === "POST" && p === "/api/bots/forget-trade") return (sendCmd(String((await body(req)).key), "forget-trade"), json(res, 200, { ok: true }));
     if (req.method === "POST" && p === "/api/bots/forget") {
       const k = String((await body(req)).key);

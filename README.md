@@ -99,6 +99,14 @@ The terminal prints a link like `http://127.0.0.1:8790/?t=…`. Open it in your 
     retries. Afterwards the bot keeps running, flat, with new entries paused.
   - **Resume entries** lets a paused bot trade again.
 - **Pairs, positions and scans** are on the same page.
+- **Close all positions** (on the positions card, asks for confirmation):
+  1. Every live bot holding a trade closes both of its legs together, then stays running with new
+     entries paused, so nothing re-opens.
+  2. Every other position on the account is closed with a reduce-only market order (up to 2% slippage).
+  3. A bot leg that can't close yet (e.g. its swap market is shut) is left alone so you stay hedged;
+     the bot keeps trying.
+
+  A live report shows each step and ends with a check that the account is flat.
 - **Cost per $1M traded (CPM):** shown per bot and in the top row, for live bots only. It's computed
   from every fill the bot has logged for that pair, across all runs.
   - **Execution CPM** is the spread and slippage paid: each fill's distance from the mark price at
