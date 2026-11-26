@@ -28,6 +28,7 @@ const S = {
   intervalMs: 5000,
   log: [] as string[],
   input: "",
+  watch: (process.env.DASH_WATCH ?? "BTC,ETH,SOL,HYPE").split(",").map((s) => s.trim()).filter(Boolean).map((s) => sym(s)),
   confirm: null as null | { order: PlaceOrder; text: string },
 };
 const log = (m: string) => {
@@ -83,7 +84,14 @@ function render() {
 
   // markets
   L.push(c.bold(pad("MARKET", 11) + pad("MARK", 13, true) + pad("INDEX", 13, true) + pad("BASIS", 10, true) + pad("SESSION", 10, true) + "  " + "TREND"));
-  for (const t of S.tickers) {
+  // Testnet lists hundreds of markets: show the watchlist plus anything you hold or have orders on,
+  // capped to what fits on screen.
+  const active = new Set([...S.watch, ...S.positions.map((p) => p.symbol), ...S.orders.map((o) => o.symbol ?? "")]);
+  const fixedRows = 22 + Math.max(1, S.positions.length) + Math.min(8, Math.max(1, S.orders.length)) + S.log.length;
+  const room = Math.max(3, (process.stdout.rows || 40) - fixedRows);
+  const shown = S.tickers.filter((t) => active.has(t.symbol)).slice(0, room);
+  const missing = S.watch.filter((w) => S.tickers.length && !S.tickers.some((t) => t.symbol === w));
+  for (const t of shown) {
     const m = Number(t.mark_price), i = Number(t.index_price);
     const basis = t.mark_price && t.index_price ? ((m - i) / i) * 1e4 : NaN;
     const f = S.first.get(t.symbol);
@@ -93,6 +101,7 @@ function render() {
     L.push(pad(t.symbol, 11) + pad(pxFmt(t.mark_price), 13, true) + pad(c.dim(pxFmt(t.index_price)), 13, true) +
       pad(Number.isFinite(basis) ? signed(basis, 1, "bp") : "-", 10, true) + pad(signed(chg, 2, "%"), 10, true) + "  " + spark(S.hist.get(t.symbol) ?? []) + st);
   }
+  L.push(c.dim(`  ${shown.length} of ${S.tickers.length} markets · watch SYM / unwatch SYM` + (missing.length ? ` · not listed: ${missing.join(", ")}` : "")));
   L.push("");
 
   // account
@@ -125,7 +134,7 @@ function render() {
     L.push(`  ${c.dim(new Date(f.created_at).toLocaleTimeString())} ${pad(f.symbol ?? "?", 10)} ${f.side === "buy" ? c.green("buy ") : c.red("sell")} ${f.size} @ ${pxFmt(f.price)} ${f.type !== "trade" ? c.yellow(f.type) : ""}`);
   L.push(c.dim("─".repeat(W)));
   for (const l of S.log) L.push(c.dim(l));
-  L.push(c.dim("buy|sell SYM SIZE|$USD [@PRICE] [tp X|X%] [sl X|X%]   close SYM   cancel ID|SYM|all   q quit"));
+  L.push(c.dim("buy|sell SYM SIZE|$USD [@PRICE] [tp X|X%] [sl X|X%]   close SYM   cancel ID|SYM|all   watch|unwatch SYM   q quit"));
   L.push(S.confirm ? c.yellow(`${S.confirm.text}  send? [y/N] `) : `${c.cyan("›")} ${S.input}${c.inv(" ")}`);
 
   process.stdout.write(`${ESC}H${L.map((l) => l + `${ESC}K`).join("\n")}${ESC}J`);
@@ -228,6 +237,11 @@ async function run(line: string) {
         order: { type: "market", symbol, side: sz > 0 ? "sell" : "buy", size: p.size.replace("-", ""), max_slippage: "0.01", reduce_only: true, client_order_id: newClientOrderId("dash") },
         text: `CLOSE ${p.size} ${symbol} at market (reduce-only)`,
       };
+    } else if (cmd === "watch" || cmd === "unwatch") {
+      const s = sym(t[1] ?? "");
+      if (!S.tickers.some((x) => x.symbol === s)) throw new Error(`${s} is not listed`);
+      S.watch = cmd === "watch" ? [...new Set([...S.watch, s])] : S.watch.filter((w) => w !== s);
+      log(`${cmd}ed ${s}`);
     } else if (cmd === "cancel") {
       const arg = t[1];
       if (!arg) throw new Error("cancel ID|SYM|all");
