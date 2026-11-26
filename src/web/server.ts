@@ -49,6 +49,16 @@ const account = cached(20_000, async () => {
 });
 const instruments = cached(300_000, () => client.instruments());
 const tickers = cached(30_000, () => client.tickers());
+// Leverage per market, cached for 5 minutes (two weight per lookup).
+const levCache = new Map<string, { at: number; v: { perp: number | null; swap: number | null } }>();
+async function leverageFor(perp: string, swap: string) {
+  const k = `${perp}|${swap}`, c = levCache.get(k);
+  if (c && Date.now() - c.at < 300_000) return c.v;
+  const [pp, ps] = [await client.position(perp), await client.position(swap)];
+  const v = { perp: Number(pp.leverage) || null, swap: Number(ps.leverage) || null };
+  levCache.set(k, { at: Date.now(), v });
+  return v;
+}
 // Public stats feed (funding + quoted spreads): separate rate limit, costs no trading weight.
 const stats = cached(60_000, () => fetchStats());
 async function pairs() {
@@ -114,7 +124,7 @@ function startBot(cfg: any) {
     ...num("hold-hours", cfg.holdHours), ...num("max-hold-hours", cfg.maxHoldHours),
     ...num("stop-loss-usd", cfg.stopLossUsd), ...num("entry-z", cfg.entryZ), ...num("exit-z", cfg.exitZ),
     ...num("round-trip-bps", cfg.roundTripBps), ...num("poll", cfg.poll),
-    ...(cfg.autoFunding ? ["--auto-funding"] : []), ...num("exit-if-negative-carry-hours", cfg.exitIfNegativeCarryHours),
+    ...(cfg.autoFunding ? ["--auto-funding"] : []), ...num("margin-usd", cfg.marginUsd), ...num("exit-if-negative-carry-hours", cfg.exitIfNegativeCarryHours),
     ...(live ? ["--live"] : [])];
   const proc = spawn(process.execPath, args, { cwd: ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   const bot: Bot = {
@@ -200,6 +210,41 @@ function savedStates() {
   }).filter(Boolean);
 }
 
+/**
+ * Cost per million volume (CPM), from every fill the bot has logged for this pair (all runs).
+ *   volume       Σ |size × price| over fills
+ *   execCost     Σ slippage vs the mark at the time × notional: the spread actually paid
+ *   execCPM      execCost / volume × 1,000,000
+ *   netCPM       −(realized + unrealized price PnL + funding) / volume × 1,000,000 (negative: you earned)
+ */
+function cpmStats(pair: string, live: boolean, status: any) {
+  const f = stateFile(pair, live).replace(/\.json$/, ".jsonl");
+  let volume = 0, execCost = 0, fills = 0;
+  if (existsSync(f)) {
+    for (const line of readFileSync(f, "utf8").split("\n")) {
+      if (!line.includes('"fill"')) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.type !== "fill") continue;
+        const notional = Math.abs(Number(e.size) * Number(e.price));
+        if (!Number.isFinite(notional)) continue;
+        volume += notional;
+        execCost += (Number(e.slippageBps) / 1e4) * notional;
+        fills++;
+      } catch { /* skip */ }
+    }
+  }
+  const realized = Number(status?.realizedUsd ?? 0), unrealized = Number(status?.trade?.pnl ?? 0);
+  // Funding: banked from closed trades, plus the open trade's so far.
+  const funding = Number(status?.fundingClosedUsd ?? 0) + (status?.funding ? Number(status.funding.perp) + Number(status.funding.swap) : 0);
+  const net = realized + unrealized + funding;
+  return {
+    fills, volumeUsd: volume, execCostUsd: execCost, netPnlUsd: net,
+    execCpm: volume ? (execCost / volume) * 1e6 : null,
+    netCpm: volume ? (-net / volume) * 1e6 : null,
+  };
+}
+
 function recentEvents(pair: string, live: boolean, n = 50) {
   const f = stateFile(pair, live).replace(/\.json$/, ".jsonl");
   if (!existsSync(f)) return [];
@@ -264,10 +309,22 @@ const server = createServer(async (req, res) => {
       });
     }
     if (req.method === "GET" && p === "/api/pairs") return json(res, 200, await pairs());
+    if (req.method === "GET" && p === "/api/leverage") {
+      // Leverage configured in the Omni app for each leg (the API can't change it), for the margin preview.
+      const key = String(url.searchParams.get("pair") ?? "").toUpperCase();
+      const pr = discoverPairs((await instruments()).data ?? []).find((x) => x.key === key);
+      if (!pr) throw new Error(`unknown pair ${key}`);
+      // A running bot on this pair already knows its leverage; otherwise look it up, but never hang the
+      // page waiting for rate-limit weight (the bots have priority): answer "pending" and let it retry.
+      const known = [...bots.values()].find((b) => b.pair === key && b.status?.leverage?.perp && b.status?.leverage?.swap)?.status.leverage;
+      const lev = known ?? await Promise.race([leverageFor(pr.perp.symbol, pr.swap.symbol), new Promise<null>((r) => setTimeout(() => r(null), 3000))]);
+      const a = await account();
+      return json(res, 200, { ...(lev ?? { perp: null, swap: null }), pending: !lev, available: a.data ? Number(a.data.account.cross.available) : null });
+    }
     if (req.method === "GET" && p === "/api/bots") {
       const list = [...bots.entries()].map(([key, b]) => ({
         key, pair: b.pair, live: b.live, cfg: b.cfg, wanted: b.wanted, restarts: b.restarts, restartAt: b.restartAt ?? null, fatal: b.fatal ?? null, running: !!b.proc, startedAt: b.startedAt, exitedAt: b.exitedAt, exitCode: b.exitCode,
-        args: b.args.slice(2).join(" "), status: b.status, series: b.series, log: b.log.slice(-80), events: recentEvents(b.pair, b.live, 40),
+        args: b.args.slice(2).join(" "), status: b.status, cpm: cpmStats(b.pair, b.live, b.status), series: b.series, log: b.log.slice(-80), events: recentEvents(b.pair, b.live, 40),
       }));
       return json(res, 200, { bots: list, saved: savedStates() });
     }

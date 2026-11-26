@@ -41,7 +41,7 @@ header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-
 .gauge .fill { height: 100%; background: var(--green); transition: width .4s; }
 main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 main > *, .cols > * { min-width: 0; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 12px; }
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; box-shadow: var(--shadow); }
 .stat .k { color: var(--muted); font-size: 12px; }
 .stat .v { font: 600 20px/1.3 var(--mono); margin-top: 2px; }
@@ -123,6 +123,8 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
     <div class="stat"><div class="k">Margin used</div><div class="v" id="sMargin">–</div></div>
     <div class="stat"><div class="k">Bots running</div><div class="v" id="sBots">0</div></div>
     <div class="stat"><div class="k">Bot realized PnL</div><div class="v" id="sReal">–</div></div>
+    <div class="stat" title="Total traded by the bots (both legs, all fills, all runs)"><div class="k">Bot volume</div><div class="v" id="sVol">–</div></div>
+    <div class="stat" title="Cost per $1M traded. Net: everything (price PnL + funding), negative means you earned. Exec: spread and slippage paid."><div class="k">Cost per $1M (CPM)</div><div class="v" id="sCpm">–</div><div class="hint" id="sCpmSub"></div></div>
   </div>
 
   <div class="cols">
@@ -135,9 +137,15 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--pane
     <section class="card">
       <h2>Start a bot</h2>
       <div class="body form">
+        <label>Pair <select id="fPair"></select></label>
+        <div>
+          <div class="hint" style="margin-bottom:4px">Size each trade by</div>
+          <div class="seg" id="fSizeMode"><button data-v="margin" class="on">Margin per trade</button><button data-v="notional">Notional per leg</button></div>
+        </div>
         <div class="grid2">
-          <label>Pair <select id="fPair"></select></label>
-          <label>Notional per leg (USD) <input id="fNotional" type="number" value="500" min="10" step="50"></label>
+          <label id="marginBox">Margin per trade (USD, both legs) <input id="fMargin" type="number" value="50" min="1" step="10"></label>
+          <label id="notionalBox" style="display:none">Notional per leg (USD) <input id="fNotional" type="number" value="500" min="10" step="50"></label>
+          <div class="hint" id="sizePreview" style="align-self:end"></div>
         </div>
         <div>
           <div class="hint" style="margin-bottom:4px">Strategy</div>
@@ -282,11 +290,13 @@ async function loadPairs() {
       : `<tr><td colspan="11" class="empty">${r.err ? esc(r.err) : "No perp/swap pairs found"}</td></tr>`;
     document.querySelectorAll("[data-use]").forEach((b) => b.onclick = () => { $("#fPair").value = b.dataset.use; autofill(); $("#fPair").scrollIntoView({ behavior: "smooth", block: "center" }); });
     $("#pairsAt").textContent = (r.at ? "prices " + ago(r.at) : "") + (r.fundingAt ? ` · funding ${ago(r.fundingAt)}` : "") + (r.fundingErr ? ` · funding feed error: ${r.fundingErr}` : "");
-    if (!autofilled) autofill();
+    if (!autofilled) { autofill(); sizePreview(); }
   } catch (e) { $("#pairs tbody").innerHTML = `<tr><td colspan="11" class="err">${esc(e.message)}</td></tr>`; }
 }
 
 // ---------- funding ----------
+// Cost per $1M: positive is a cost (red), negative means you earned (green).
+const cpmFmt = (v) => (v == null || isNaN(v)) ? "–" : `<span class="${v > 0 ? "neg" : v < 0 ? "pos" : ""}">${v < 0 ? "−" : ""}$${n(Math.abs(v), 0)}</span>`;
 const pct = (x, d = 2) => (x == null || isNaN(x)) ? "–" : signed(x * 100, d, "%");
 function carryCells(f) {
   if (!f) return `<td class="num muted">–</td><td class="num muted">–</td><td class="num muted">–</td>`;
@@ -313,7 +323,45 @@ function autofill() {
   autofilled = true;
   calc();
 }
-$("#fPair").onchange = autofill;
+$("#fPair").onchange = () => { autofill(); sizePreview(); };
+
+// ---------- sizing: margin per trade or notional per leg ----------
+let SIZE = "margin";
+document.querySelectorAll("#fSizeMode button").forEach((b) => b.onclick = () => {
+  SIZE = b.dataset.v;
+  document.querySelectorAll("#fSizeMode button").forEach((x) => x.classList.toggle("on", x === b));
+  $("#marginBox").style.display = SIZE === "margin" ? "" : "none";
+  $("#notionalBox").style.display = SIZE === "notional" ? "" : "none";
+  sizePreview();
+});
+let LEV = {}, levT;
+async function sizePreview() {
+  const pair = $("#fPair").value;
+  if (!pair) return;
+  if (!LEV[pair]) {
+    $("#sizePreview").textContent = "reading leverage…";
+    let r;
+    try { r = await api(`/api/leverage?pair=${encodeURIComponent(pair)}`); } catch (e) { $("#sizePreview").textContent = e.message; return; }
+    if (r.pending) {
+      $("#sizePreview").textContent = "reading leverage… (waiting for rate-limit room; the bots go first)";
+      clearTimeout(levT); levT = setTimeout(sizePreview, 4000);
+      return;
+    }
+    LEV[pair] = r;
+  }
+  const L = LEV[pair], lp = L.perp || 1, ls = L.swap || 1;
+  const levTxt = `${L.perp ? lp + "x" : "1x?"} perp / ${L.swap ? ls + "x" : "1x?"} swap`;
+  const unknown = !L.perp || !L.swap ? " (leverage unknown for a leg: assumes 1x; set it in the Omni app)" : "";
+  if (SIZE === "margin") {
+    const m = +$("#fMargin").value || 0, notional = m / (1 / lp + 1 / ls);
+    const over = L.available != null && m > L.available ? ` · <span class="neg">more than the ${n(L.available)} available</span>` : "";
+    $("#sizePreview").innerHTML = `≈ <b>${n(notional, 0)}$ per leg</b> at ${levTxt}${unknown}${over}`;
+  } else {
+    const N = +$("#fNotional").value || 0;
+    $("#sizePreview").innerHTML = `uses ≈ <b>${n(N / lp + N / ls, 2)}$ margin</b> at ${levTxt}${unknown}`;
+  }
+}
+["#fMargin", "#fNotional"].forEach((s) => $(s).oninput = () => { clearTimeout(levT); levT = setTimeout(sizePreview, 200); });
 $("#fAuto").onchange = () => {
   const on = $("#fAuto").checked;
   ["#fPerpApr", "#fSwapLong", "#fSwapShort"].forEach((s) => $(s).readOnly = on);
@@ -356,7 +404,8 @@ $("#startBtn").onclick = async () => {
   if (!pair) return toast("Pick a pair");
   const f = JSON.parse($("#calc").dataset.f || "{}");
   const cfg = {
-    pair, live, mode: MODE, dir: $("#fDir").value, notionalUsd: +$("#fNotional").value,
+    pair, live, mode: MODE, dir: $("#fDir").value,
+    ...(SIZE === "margin" ? { marginUsd: +$("#fMargin").value } : { notionalUsd: +$("#fNotional").value }),
     stopLossUsd: +$("#fStop").value, maxHoldHours: +$("#fMaxHold").value, roundTripBps: +$("#fCost").value,
     entryZ: +$("#fEntryZ").value, exitZ: +$("#fExitZ").value, poll: +$("#fPoll").value,
     ...(MODE === "carry" ? {
@@ -364,7 +413,7 @@ $("#startBtn").onclick = async () => {
       autoFunding: $("#fAuto").checked, exitIfNegativeCarryHours: $("#fAuto").checked ? +$("#fNegHours").value : 0,
     } : {}),
   };
-  if (live && !confirm(`Start a LIVE ${MODE} bot on ${pair} with ${cfg.notionalUsd} USD per leg?${MODE === "carry" ? `\nDirection: ${cfg.dir.replace("_", " ")}` : ""}`)) return;
+  if (live && !confirm(`Start a LIVE ${MODE} bot on ${pair} ${SIZE === "margin" ? `using ${cfg.marginUsd} USD of margin (${$("#sizePreview").textContent})` : `with ${cfg.notionalUsd} USD per leg`}?${MODE === "carry" ? `\nDirection: ${cfg.dir.replace("_", " ")}` : ""}`)) return;
   try { const r = await api("/api/bots/start", cfg); toast(`Started ${r.key}`); loadBots(); } catch (e) { toast(e.message); }
 };
 
@@ -390,8 +439,18 @@ async function loadBots() {
     $("#sBots").textContent = bots.filter((b) => b.running).length;
     const crashed = bots.filter((b) => b.wanted && !b.running).length;
     if (crashed) $("#sBots").innerHTML += ` <span class="neg" style="font-size:13px">(${crashed} restarting)</span>`;
-    const real = bots.reduce((s, b) => s + (b.status?.realizedUsd ?? 0), 0);
+    const real = bots.filter((b) => b.live).reduce((s, b) => s + (b.status?.realizedUsd ?? 0), 0);
     $("#sReal").innerHTML = bots.length ? signed(real) : "–";
+    // Totals use live bots only (paper fills would distort them); fall back to dry runs, labelled.
+    const liveVol = bots.filter((b) => b.live).reduce((s, b) => s + (b.cpm?.volumeUsd ?? 0), 0);
+    const pool = bots.filter((b) => (liveVol ? b.live : !b.live));
+    const vol = pool.reduce((s, b) => s + (b.cpm?.volumeUsd ?? 0), 0);
+    const exec = pool.reduce((s, b) => s + (b.cpm?.execCostUsd ?? 0), 0);
+    const net = pool.reduce((s, b) => s + (b.cpm?.netPnlUsd ?? 0), 0);
+    const tag = vol && !liveVol ? " (dry runs)" : "";
+    $("#sVol").innerHTML = vol ? "$" + n(vol, 0) + (tag ? `<div class="hint">${tag.trim()}</div>` : "") : "–";
+    $("#sCpm").innerHTML = vol ? cpmFmt((-net / vol) * 1e6) : "–";
+    $("#sCpmSub").textContent = vol ? `net · exec $${n((exec / vol) * 1e6, 0)}${tag}` : "";
     if (!bots.length) $("#bots").innerHTML = `<div class="empty">No bots yet. Pick a pair and start one →</div>`;
     else $("#bots").innerHTML = bots.map((b) => {
       const s = b.status || {}, t = s.trade;
@@ -429,7 +488,10 @@ async function loadBots() {
           <div class="metric"><div class="k">Realized · trades</div><div class="v">${signed(s.realizedUsd ?? 0)} · ${s.trades ?? 0}</div></div>
           <div class="metric"><div class="k">Perp premium dev</div><div class="v">${signed(s.devBps, 1, "bp")} <span class="muted">z ${n(s.z, 2)}</span></div></div>
           <div class="metric"><div class="k">Swap market</div><div class="v">${esc(s.swapStatus ?? "–")}${s.minsToClose != null && s.swapStatus === "open" ? ` <span class="muted">${(s.minsToClose / 60).toFixed(1)}h</span>` : ""}</div></div>
-          <div class="metric"><div class="k">Avg fill slippage</div><div class="v">${slip != null ? n(slip, 1) + "bp" : "–"}</div></div>
+          <div class="metric"><div class="k">Volume · fills</div><div class="v">${b.cpm?.volumeUsd ? "$" + n(b.cpm.volumeUsd, 0) : "–"} <span class="muted">· ${b.cpm?.fills ?? 0}</span></div></div>
+          <div class="metric" title="Spread and slippage paid per $1M traded (avg fill slippage ${slip != null ? n(slip, 1) + "bp" : "–"})"><div class="k">Exec CPM</div><div class="v">${b.cpm?.execCpm != null ? "$" + n(b.cpm.execCpm, 0) : "–"}</div></div>
+          <div class="metric" title="Everything (price PnL + funding) per $1M traded; negative means you earned"><div class="k">Net CPM</div><div class="v">${b.cpm?.netCpm != null ? cpmFmt(b.cpm.netCpm) : "–"}</div></div>
+          <div class="metric"><div class="k">Margin · leverage</div><div class="v" style="font-size:12.5px">${s.margin ? `$${n(s.margin.perp + s.margin.swap)}` : s.sizing?.marginUsd ? `$${n(s.sizing.marginUsd)} set` : "–"} <span class="muted">${s.leverage ? `· ${s.leverage.perp ?? "?"}x/${s.leverage.swap ?? "?"}x` : ""}</span></div></div>
           <div class="metric"><div class="k">Liq. perp / swap</div><div class="v" style="font-size:12px">${s.liq ? `${px(s.liq.perp)} / ${px(s.liq.swap)}` : "–"}</div></div>
         </div>
         <div class="charts">

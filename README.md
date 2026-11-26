@@ -99,6 +99,19 @@ The terminal prints a link like `http://127.0.0.1:8790/?t=…`. Open it in your 
     retries. Afterwards the bot keeps running, flat, with new entries paused.
   - **Resume entries** lets a paused bot trade again.
 - **Pairs, positions and scans** are on the same page.
+- **Cost per $1M traded (CPM):** shown per bot and in the top row, for live bots only. It's computed
+  from every fill the bot has logged for that pair, across all runs.
+  - **Execution CPM** is the spread and slippage paid: each fill's distance from the mark price at
+    that moment, per $1,000,000 traded.
+  - **Net CPM** is everything (price PnL, open-position PnL and funding) per $1,000,000 traded.
+    Negative means you earned while trading.
+  - Dry runs log paper fills too, so you can estimate CPM before going live.
+- **Size by margin:** choose "Margin per trade" and enter the USD margin both legs should use together.
+  The API can't set leverage, so the panel reads the leverage set for each market in the Omni app and
+  previews the position size: notional per leg = margin ÷ (1/perp leverage + 1/swap leverage).
+  The bot re-checks this at entry. If a leg's leverage is unknown, it assumes 1x, giving the smallest
+  position. It won't enter if the margin exceeds what's available. Each bot card shows the margin
+  in use and the leverage per leg. The CLI equivalent is `--margin-usd`.
 
 Safety:
 - The panel listens on 127.0.0.1 only.

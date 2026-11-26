@@ -28,6 +28,7 @@ const { values: a } = parseArgs({
     mode: { type: "string", default: "stat" },
     dir: { type: "string" },
     "notional-usd": { type: "string", default: "500" },
+    "margin-usd": { type: "string" },
     "entry-z": { type: "string", default: "2" },
     "exit-z": { type: "string", default: "0.5" },
     "round-trip-bps": { type: "string", default: "24" },
@@ -146,7 +147,7 @@ interface Trade {
   devAtEntry: number;
   carryBpsDay: number;
 }
-interface State { stats: any; trade: Trade | null; realizedUsd: number; trades: number; paused: string | null }
+interface State { stats: any; trade: Trade | null; realizedUsd: number; trades: number; paused: string | null; fundingUsd: number }
 
 const SP: SignalParams = {
   entryZ: +a["entry-z"]!, exitZ: +a["exit-z"]!, roundTripBps: +a["round-trip-bps"]!, minEdgeBps: +a["min-edge-bps"]!,
@@ -210,8 +211,12 @@ function pairBudget() {
  */
 async function execPair(legs: [LegReq, LegReq]): Promise<[Fill, Fill] | null> {
   if (!LIVE) {
-    // Paper fills: mark ± a quarter of the round-trip cost each.
-    return legs.map((l) => ({ size: Number(l.size), price: l.ref * (1 + ((l.side === "buy" ? 1 : -1) * SP.roundTripBps) / 4 / 1e4) })) as [Fill, Fill];
+    // Paper fills: mark ± a quarter of the round-trip cost each (logged so dry runs get cost stats too).
+    return legs.map((l) => {
+      const price = l.ref * (1 + ((l.side === "buy" ? 1 : -1) * SP.roundTripBps) / 4 / 1e4);
+      log("fill", { symbol: l.symbol, side: l.side, size: l.size, price, slippageBps: SP.roundTripBps / 4, paper: true });
+      return { size: Number(l.size), price };
+    }) as [Fill, Fill];
   }
   const est = client.estimatedRemaining();
   if (est !== null && est < pairBudget() + 6) {
@@ -239,8 +244,31 @@ async function execPair(legs: [LegReq, LegReq]): Promise<[Fill, Fill] | null> {
   return fills as [Fill, Fill];
 }
 
+/**
+ * Notional per leg. With --margin-usd, size the trade so both legs together use that much initial
+ * margin at the leverage configured for each market in the Omni app (the API can't set leverage):
+ * margin = N/levPerp + N/levSwap  →  N = margin / (1/levPerp + 1/levSwap).
+ */
+async function legNotional(): Promise<{ usd: number; note: string } | { error: string }> {
+  if (a["margin-usd"] === undefined) return { usd: +a["notional-usd"]!, note: "" };
+  const margin = +a["margin-usd"]!;
+  if (!(margin > 0)) return { error: "--margin-usd must be positive" };
+  const [pp, ps] = [await client.position(pair.perp.symbol), await client.position(pair.swap.symbol)];
+  // Unknown leverage → assume 1x: the smallest (safest) position for the margin.
+  const lp = Number(pp.leverage) > 0 ? Number(pp.leverage) : 1, ls = Number(ps.leverage) > 0 ? Number(ps.leverage) : 1;
+  lastLev = { perp: Number(pp.leverage) || null, swap: Number(ps.leverage) || null };
+  if (LIVE) {
+    const avail = Number((await client.account()).cross.available);
+    if (avail < margin) return { error: `margin ${margin}$ is more than the ${avail.toFixed(2)}$ available` };
+  }
+  const usd = margin / (1 / lp + 1 / ls);
+  return { usd, note: ` · ${margin}$ margin at ${lp}x perp / ${ls}x swap${pp.leverage && ps.leverage ? "" : " (leverage unknown for a leg: assumed 1x)"}` };
+}
+
 async function enter(dir: Dir, tp: Ticker, ts_: Ticker, devBps: number) {
-  const usd = +a["notional-usd"]!;
+  const sizing = await legNotional();
+  if ("error" in sizing) return say(`not entering: ${sizing.error}`);
+  const usd = sizing.usd;
   const pm = Number(tp.mark_price), sm = Number(ts_.mark_price);
   const [pi, si] = [await inst(pair.perp.symbol), await inst(pair.swap.symbol)];
   const swapSide = dir === "short_perp" ? "buy" : "sell", perpSide = dir === "short_perp" ? "sell" : "buy";
@@ -249,7 +277,7 @@ async function enter(dir: Dir, tp: Ticker, ts_: Ticker, devBps: number) {
   if (sc.problems.length || pc.problems.length) return say(`cannot size legs: ${[...sc.problems, ...pc.problems].join("; ")}`);
   const est = client.estimatedRemaining();
   if (LIVE && est !== null && est < pairBudget() + 6) return say(`signal ${dir}, but waiting for weight (${est} < ${pairBudget() + 6})`);
-  say(`ENTER ${dir}: ${swapSide} ${sc.size} ${pair.swap.symbol} (≈${sc.notional}$) + ${perpSide} ${pc.size} ${pair.perp.symbol} (≈${pc.notional}$)`);
+  say(`ENTER ${dir}: ${swapSide} ${sc.size} ${pair.swap.symbol} (≈${sc.notional}$) + ${perpSide} ${pc.size} ${pair.perp.symbol} (≈${pc.notional}$)${sizing.note}`);
   // Swap leg first in the pair: if its market just closed it is refused instantly and the perp unwinds.
   const r = await execPair([
     { symbol: pair.swap.symbol, side: swapSide, size: sc.size, reduceOnly: false, ref: sm },
@@ -287,6 +315,8 @@ async function exit(why: string, pm: number, sm: number, swapOpen: boolean) {
   const [s, p] = r;
   const pnl = t.perp.size * (p.price - t.perp.entry) + t.swap.size * (s.price - t.swap.entry);
   state.realizedUsd += pnl;
+  if (lastFunding) state.fundingUsd = (state.fundingUsd ?? 0) + lastFunding.perp + lastFunding.swap;
+  lastFunding = null;
   state.trades++;
   say(`closed: price PnL ${pnl.toFixed(2)}$ (funding shows in the positions' cum_funding) · session total ${state.realizedUsd.toFixed(2)}$ over ${state.trades} trade(s)`);
   log("exit", { why, pnl, heldMin: (Date.now() - t.openedAt) / 60000 });
@@ -311,6 +341,8 @@ let snap: Record<string, unknown> = {};
 let cycleN = 0;
 let lastFunding: { perp: number; swap: number; at: number } | null = null;
 let lastLiq: { perp: string | null; swap: string | null } | null = null;
+let lastLev: { perp: number | null; swap: number | null } | null = null;
+let lastMargin: { perp: number; swap: number } | null = null;
 let carryWarned = 0;
 let auto: PairFunding | null = null;
 let autoAt = 0;
@@ -370,6 +402,8 @@ async function cycle() {
     const fund = Number(pp.cum_funding) + Number(ps.cum_funding);
     lastFunding = { perp: Number(pp.cum_funding), swap: Number(ps.cum_funding), at: Date.now() };
     lastLiq = { perp: pp.liquidation_price, swap: ps.liquidation_price };
+    lastLev = { perp: Number(pp.leverage) || null, swap: Number(ps.leverage) || null };
+    lastMargin = { perp: Number(pp.initial_margin), swap: Number(ps.initial_margin) };
     if (cycleN % 30 === 0) say(`funding so far: perp ${pp.cum_funding}$ + swap ${ps.cum_funding}$ = ${fund.toFixed(4)}$`);
     // Hedge drift: price moves change each leg's USD exposure; top up the perp leg (24/7) to re-neutralise.
     const net = Number(pp.size) * pm + Number(ps.size) * sm, gross = Math.abs(Number(pp.size) * pm) + Math.abs(Number(ps.size) * sm);
@@ -447,8 +481,9 @@ function emitStatus() {
   console.log("@@" + JSON.stringify({
     t: Date.now(), pair: pair?.key ?? a.pair, perp: pair?.perp.symbol, swap: pair?.swap.symbol, mode: a.mode, live: LIVE, ...snap,
     trade: tr ? { ...tr, pnl: pm && sm ? +legsPnl(tr, pm, sm).toFixed(4) : null } : null,
-    realizedUsd: state?.realizedUsd ?? 0, trades: state?.trades ?? 0, funding: lastFunding, liq: lastLiq,
+    realizedUsd: state?.realizedUsd ?? 0, trades: state?.trades ?? 0, funding: lastFunding, fundingClosedUsd: state?.fundingUsd ?? 0, liq: lastLiq,
     exitPending: exitRequested, paused: state?.paused ?? null, blocked,
+    margin: lastMargin, leverage: lastLev, sizing: a["margin-usd"] !== undefined ? { marginUsd: +a["margin-usd"]! } : { notionalUsd: +a["notional-usd"]! },
     rates: auto ? { perpAnnual: auto.perpAnnual, swapLongPays: auto.swapLongPays, swapShortReceives: auto.swapShortReceives, carryAnnual: auto.carryAnnual,
       best: auto.best, roundTripBps: auto.roundTripBps, curveCarry: auto.curveCarry, at: autoAt, err: autoErr, negativeSince } : null,
     weight: client.budget.remaining, limit: client.budget.limit,
@@ -476,7 +511,7 @@ async function prepare(): Promise<string | null> {
     const saved = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;
     state = {
       stats: SpreadStats.from(saved?.stats, +a["half-life-min"]! * 60), trade: saved?.trade ?? null,
-      realizedUsd: saved?.realizedUsd ?? 0, trades: saved?.trades ?? 0, paused: saved?.paused ?? null,
+      realizedUsd: saved?.realizedUsd ?? 0, trades: saved?.trades ?? 0, paused: saved?.paused ?? null, fundingUsd: saved?.fundingUsd ?? 0,
     };
     say(`DN ${pair.key}: perp ${pair.perp.symbol} ⇄ swap ${pair.swap.symbol} · mode ${a.mode}${a.mode === "carry" ? ` ${a.dir}` : ""} · ${a["notional-usd"]}$/leg · ` +
       `entry |z|≥${SP.entryZ} exit |z|≤${SP.exitZ} · costs ${SP.roundTripBps}bp · state ${statePath}${LIVE ? "" : " · DRY RUN (paper fills; --live to trade)"}`);
