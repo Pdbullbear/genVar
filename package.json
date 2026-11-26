@@ -1,0 +1,32 @@
+{
+  "name": "omni-kit",
+  "version": "0.1.0",
+  "description": "TypeScript SDK, MCP server, terminal dashboard and grid bot for the Variational Omni API (testnet early access)",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "main": "dist/sdk/index.js",
+  "types": "dist/sdk/index.d.ts",
+  "bin": {
+    "omni-mcp": "dist/mcp/server.js",
+    "omni-dash": "dist/tui/dashboard.js",
+    "omni-grid": "dist/bot/grid.js",
+    "omni-mock": "dist/mock/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "mock": "node dist/mock/server.js",
+    "dash": "node dist/tui/dashboard.js",
+    "mcp": "node dist/mcp/server.js",
+    "grid": "node dist/bot/grid.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
