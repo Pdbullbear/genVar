@@ -176,6 +176,7 @@ export interface Signal {
 export function signal(stats: SpreadStats, logRatio: number, p: SignalParams, f: Funding, open: Dir | null): Signal {
   const devBps = stats.devBps(logRatio), z = stats.z(logRatio);
   if (stats.n < p.minSamples) return { action: "wait", reason: `warming up ${stats.n}/${p.minSamples}`, devBps, z, edgeBps: 0 };
+  if (!Number.isFinite(p.roundTripBps) || !Number.isFinite(p.minEdgeBps)) return { action: "wait", reason: "trading costs unknown", devBps, z, edgeBps: 0 };
   if (open) {
     const reverted = Math.abs(z) <= p.exitZ || (open === "short_perp" ? devBps <= 0 : devBps >= 0);
     return reverted
@@ -218,7 +219,12 @@ export interface PairFunding {
    * position: the swap gives it back through its price, and the perp rolls on its own schedule.
    */
   curveCarry: boolean;
+  /** True when a leg had no quote in the feed (e.g. its market is closed) and a fallback spread was used. */
+  spreadEstimated: boolean;
 }
+
+/** Spread assumed for a leg the feed has no quote for (closed market): deliberately on the high side. */
+export const FALLBACK_SPREAD_BPS = 10;
 
 /** Swap codes whose funding is the futures-curve roll (per docs.variational.io/omni/trading/swaps). */
 export const CURVE_CARRY_SWAPS = ["USOIL", "UKOIL", "COPP", "COCOA", "VXI", "DXI", "GASOL", "HOIL", "NTGAS"];
@@ -235,7 +241,10 @@ export function pairFunding(stats: Stats, perpSymbol: string, swapSymbol: string
   const curveCarry = CURVE_CARRY_SWAPS.includes(swapSymbol.toUpperCase().replace(/-SWAP$/, ""));
   const best: Dir | null = curveCarry ? null : Math.max(carryAnnual.long_perp, carryAnnual.short_perp) > 0
     ? (carryAnnual.long_perp >= carryAnnual.short_perp ? "long_perp" : "short_perp") : null;
-  const perpSpreadBps = Number(pl.base_spread_bps), swapSpreadBps = Number(sl.base_spread_bps);
+  // Legs without a quote (e.g. a closed swap market) publish no spread: assume a conservative one.
+  const sp = (v: string | null | undefined) => { const x = Number(v); return v != null && Number.isFinite(x) && x >= 0 ? x : null; };
+  const ps = sp(pl.base_spread_bps), ss = sp(sl.base_spread_bps);
+  const perpSpreadBps = ps ?? FALLBACK_SPREAD_BPS, swapSpreadBps = ss ?? FALLBACK_SPREAD_BPS;
   return {
     funding: {
       perpPct8h: (pf.annual * 100) / (365 * 3),
@@ -244,6 +253,7 @@ export function pairFunding(stats: Stats, perpSymbol: string, swapSymbol: string
     },
     perpAnnual: pf.annual, swapLongPays: sf.longPays, swapShortReceives: sf.shortReceives, carryAnnual, best,
     roundTripBps: Math.max(2, +(perpSpreadBps + swapSpreadBps).toFixed(2)), perpSpreadBps, swapSpreadBps,
+    spreadEstimated: ps === null || ss === null,
     perpMark: Number(pl.mark_price), swapMark: Number(sl.mark_price),
     nextPerpAt: pf.nextAt, nextSwapAt: sf.nextAt, swapNextIsMultiDay: sf.nextIsMultiDay, curveCarry,
   };

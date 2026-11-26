@@ -314,7 +314,7 @@ function carryCells(f) {
     const star = f.best === d ? " ★" : "";
     return `<td class="num" title="${be ? `break-even ≈ ${be} days` : "doesn't earn"}">${f.curveCarry ? `<span class="muted">${(f.carryAnnual[d] * 100).toFixed(2)}%</span>` : pct(f.carryAnnual[d])}${star}${be && !f.curveCarry ? `<div class="hint">${be}d to break even</div>` : ""}</td>`;
   };
-  return cell("long_perp") + cell("short_perp") + `<td class="num">${n(f.roundTripBps, 1)}bp${f.curveCarry ? `<div class="hint" title="This swap's funding offsets its futures roll; a hedged position gives it back through the price">roll carry, not real</div>` : ""}</td>`;
+  return cell("long_perp") + cell("short_perp") + `<td class="num" ${f.spreadEstimated ? 'title="A leg has no live quote (market closed?): cost estimated"' : ""}>${n(f.roundTripBps, 1)}bp${f.spreadEstimated ? "*" : ""}${f.curveCarry ? `<div class="hint" title="This swap's funding offsets its futures roll; a hedged position gives it back through the price">roll carry, not real</div>` : ""}</td>`;
 }
 
 // Fill the three rate fields (and costs) from the feed for the selected pair.
@@ -534,7 +534,7 @@ async function loadBots() {
         <div class="metrics">
           <div class="metric"><div class="k">Position</div><div class="v">${t ? `${n(Math.abs(t.perp.size) * (s.pm || 0), 0)}$ ×2` : "flat"}</div></div>
           <div class="metric"><div class="k">Legs PnL</div><div class="v">${t ? signed(t.pnl) : "–"}</div></div>
-          <div class="metric"><div class="k">Funding received</div><div class="v">${fund != null ? signed(fund, 4) : `<span class="muted">${b.live ? "after next check" : "n/a (dry)"}</span>`}</div></div>
+          <div class="metric"><div class="k">Funding received</div><div class="v">${fund != null ? signed(fund, 4) : `<span class="muted">${!b.live ? "n/a (dry)" : t ? "after next check" : "–"}</span>`}</div></div>
           <div class="metric"><div class="k">Realized · trades</div><div class="v">${signed(s.realizedUsd ?? 0)} · ${s.trades ?? 0}</div></div>
           <div class="metric"><div class="k">Perp premium dev</div><div class="v">${signed(s.devBps, 1, "bp")} <span class="muted">z ${n(s.z, 2)}</span></div></div>
           <div class="metric"><div class="k">Swap market</div><div class="v">${esc(s.swapStatus ?? "–")}${s.minsToClose != null && s.swapStatus === "open" ? ` <span class="muted">${(s.minsToClose / 60).toFixed(1)}h</span>` : ""}</div></div>

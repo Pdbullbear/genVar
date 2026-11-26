@@ -71,7 +71,7 @@ async function pairs() {
     return {
       funding: f && {
         perpAnnual: f.perpAnnual, swapLongPays: f.swapLongPays, swapShortReceives: f.swapShortReceives, carryAnnual: f.carryAnnual,
-        best: f.best, roundTripBps: f.roundTripBps, curveCarry: f.curveCarry, nextPerpAt: f.nextPerpAt, nextSwapAt: f.nextSwapAt,
+        best: f.best, roundTripBps: f.roundTripBps, spreadEstimated: f.spreadEstimated, curveCarry: f.curveCarry, nextPerpAt: f.nextPerpAt, nextSwapAt: f.nextSwapAt,
         // Breakeven in days for each direction, at the quoted spreads.
         breakevenDays: Object.fromEntries((["long_perp", "short_perp"] as const).map((d) => [d, f.carryAnnual[d] > 0 ? Math.ceil(f.roundTripBps / (f.carryAnnual[d] * 1e4 / 365)) : null])),
       },

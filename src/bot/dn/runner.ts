@@ -363,9 +363,9 @@ async function refreshFunding(force = false) {
     auto = pf;
     autoErr = null;
     Object.assign(F, pf.funding);
-    SP.roundTripBps = pf.roundTripBps;
+    if (Number.isFinite(pf.roundTripBps)) SP.roundTripBps = pf.roundTripBps;
     if (changed) say(`funding (auto): perp ${(pf.perpAnnual * 100).toFixed(2)}%/yr, swap longs pay ${(pf.swapLongPays * 100).toFixed(2)}%, shorts receive ${(pf.swapShortReceives * 100).toFixed(2)}% → ` +
-      `carry long perp ${(pf.carryAnnual.long_perp * 100).toFixed(2)}%/yr, short perp ${(pf.carryAnnual.short_perp * 100).toFixed(2)}%/yr · round trip ≈${pf.roundTripBps}bp` +
+      `carry long perp ${(pf.carryAnnual.long_perp * 100).toFixed(2)}%/yr, short perp ${(pf.carryAnnual.short_perp * 100).toFixed(2)}%/yr · round trip ≈${pf.roundTripBps}bp${pf.spreadEstimated ? " (estimated: a leg has no live quote)" : ""}` +
       (pf.curveCarry ? " · NOTE: futures-roll funding, not real carry" : ""));
   } catch (e) {
     autoErr = (e as Error).message;
@@ -515,7 +515,7 @@ async function prepare(): Promise<string | null> {
       stats: SpreadStats.from(saved?.stats, +a["half-life-min"]! * 60), trade: saved?.trade ?? null,
       realizedUsd: saved?.realizedUsd ?? 0, trades: saved?.trades ?? 0, paused: saved?.paused ?? null, fundingUsd: saved?.fundingUsd ?? 0,
     };
-    say(`DN ${pair.key}: perp ${pair.perp.symbol} ⇄ swap ${pair.swap.symbol} · mode ${a.mode}${a.mode === "carry" ? ` ${a.dir}` : ""} · ${a["notional-usd"]}$/leg · ` +
+    say(`DN ${pair.key}: perp ${pair.perp.symbol} ⇄ swap ${pair.swap.symbol} · mode ${a.mode}${a.mode === "carry" ? ` ${a.dir}` : ""} · ${a["margin-usd"] !== undefined ? `${a["margin-usd"]}$ margin per trade` : `${a["notional-usd"]}$/leg`} · ` +
       `entry |z|≥${SP.entryZ} exit |z|≤${SP.exitZ} · costs ${SP.roundTripBps}bp · state ${statePath}${LIVE ? "" : " · DRY RUN (paper fills; --live to trade)"}`);
     if (saved?.stats?.n) say(`resumed spread stats (${saved.stats.n} samples)${state.trade ? ` and an OPEN ${state.trade.dir} trade` : ""}`);
     if (state.paused) say(`entries are paused (${state.paused}); Resume entries to trade again`);

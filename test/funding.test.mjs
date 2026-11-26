@@ -36,3 +36,11 @@ test("futures-roll swaps are flagged and never picked as best", () => {
   assert.equal(f.curveCarry, true);
   assert.equal(f.best, null);
 });
+
+test("a leg with no live quote gets a conservative cost, never NaN", () => {
+  const closed = { ...swap("US500-SWAP", null, ["0.05", "0.03"]), base_spread_bps: null };
+  const f = pairFunding({ listings: [perp("US500-PERP", "0.02", "3.8"), closed] }, "US500-PERP", "US500-SWAP");
+  assert.ok(Number.isFinite(f.roundTripBps));
+  assert.equal(f.roundTripBps, 13.8);
+  assert.equal(f.spreadEstimated, true);
+});
