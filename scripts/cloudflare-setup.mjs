@@ -31,6 +31,11 @@ const { values: a } = parseArgs({
 });
 const host = (a.host ?? "").toLowerCase();
 const emails = a.email ?? [];
+if (/(^|\.)(yourdomain|example)\.com$/.test(host) || emails.some((e) => /[<>]/.test(e))) {
+  console.error(`✗ "${host}" / ${emails.join(", ")} look like the placeholders from the instructions.\n` +
+    "  Use a hostname on a domain that's on your Cloudflare account (e.g. desk.<your domain>) and your real email.");
+  process.exit(2);
+}
 if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) || !emails.length) {
   console.error("usage: npm run tunnel:setup -- --host desk.example.com --email you@example.com [--email other@…]");
   process.exit(2);
@@ -54,9 +59,15 @@ const step = (m) => console.log(`• ${m}`);
 
 async function main() {
   // ---- account and zone ----
+  // A token without Account Settings › Read can't list accounts; --account <id> skips the lookup.
   const accounts = await cf("GET", "/accounts?per_page=50");
-  if (!accounts.length) throw new Error("the API token can't see any account: give it Account › Account Settings › Read");
-  const account = a.account ? accounts.find((x) => x.id === a.account || x.name === a.account) : accounts[0];
+  const isId = (s) => /^[0-9a-f]{32}$/.test(s ?? "");
+  if (!accounts.length && !isId(a.account))
+    throw new Error("the API token can't see any account. Either give it Account › Account Settings › Read, or pass " +
+      "--account <Account ID> (shown on the right of your domain's Overview page in the Cloudflare dashboard).");
+  const account = accounts.length
+    ? (a.account ? accounts.find((x) => x.id === a.account || x.name === a.account) : accounts[0])
+    : { id: a.account, name: a.account };
   if (!account) throw new Error(`account ${a.account} not found`);
   step(`account: ${account.name}`);
 
