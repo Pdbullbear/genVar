@@ -4,7 +4,9 @@
   "description": "TypeScript SDK, MCP server, terminal dashboard and grid bot for the Variational Omni API (testnet early access)",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/sdk/index.js",
   "types": "dist/sdk/index.d.ts",
   "bin": {
@@ -23,7 +25,9 @@
     "mcp": "node dist/mcp/server.js",
     "grid": "node dist/bot/grid.js",
     "dn": "node dist/bot/dn/runner.js",
-    "web": "node dist/web/server.js"
+    "web": "node dist/web/server.js",
+    "web:remote": "node scripts/web-remote.mjs",
+    "tunnel:setup": "node scripts/cloudflare-setup.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",

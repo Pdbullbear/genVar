@@ -144,6 +144,42 @@ numbers can take a few seconds to appear.
 - **Configuration errors** (an unknown pair, legs that aren't the same asset) are the only case the
   panel doesn't retry, because retrying can't fix them. The card shows the error.
 
+## Reach the panel from anywhere (Cloudflare Tunnel + Access)
+
+The bots keep running on your machine. A Cloudflare Tunnel gives the panel a private HTTPS address
+such as `https://desk.yourdomain.com`, and Cloudflare Access puts an email login in front of it.
+The panel also checks Access's signed login token on every remote request. If the remote-access
+settings are missing, it refuses remote requests, so a misconfigured tunnel can't expose it.
+
+**You need:**
+- a domain on your Cloudflare account;
+- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) installed;
+- Zero Trust enabled once at one.dash.cloudflare.com (free plan; pick a team name);
+- an API token (My Profile › API Tokens › Create Token › Custom) with:
+  - Account › Cloudflare Tunnel › Edit
+  - Account › Access: Apps and Policies › Edit
+  - Account › Access: Organizations, Identity Providers, and Groups › Read
+  - Account › Account Settings › Read
+  - Zone › Zone › Read and Zone › DNS › Edit (for your domain)
+
+**Then, once:**
+```bash
+CLOUDFLARE_API_TOKEN=… npm run tunnel:setup -- --host desk.yourdomain.com --email you@example.com
+```
+It creates (or reuses) the tunnel, routes the hostname to the panel, and adds an Access login that
+only your email passes (a one-time code by email). It writes `.env.tunnel` and the tunnel's secret
+token to `.tunnel-token`; both are git-ignored. You can re-run it safely.
+
+**Every time:**
+```bash
+npm run web:remote
+```
+This starts the panel and the tunnel together; Ctrl-C stops both.
+- Open the `remote:` link it prints, and log in with your email.
+- After the first visit, the panel remembers its token in a secure cookie, so a bookmark works
+  (e.g. on your phone).
+- The panel token is kept in `.web-token`. Delete that file to rotate the token.
+
 ## Delta-neutral swap ⇄ perp bot
 
 Several underlyings (gold, silver, platinum, palladium, US500, and oil, copper and natural gas under
