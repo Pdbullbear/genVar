@@ -68,6 +68,11 @@ async function scan() {
     console.log(`swaps seen: ${swaps.join(", ") || "none"}. If a pair is missing, its underlyings may need an alias in src/bot/dn/core.ts (ALIASES).`);
     return;
   }
+  const paired = new Set(pairs.map((p) => p.swap.symbol));
+  const lonely = insts.filter((i) => kindOf(i) === "swap" && !paired.has(i.symbol));
+  if (lonely.length)
+    console.log(`swaps with no matching perp: ${lonely.map((i) => `${i.symbol} (underlying ${i.underlying})`).join(", ")}\n` +
+      `  → if one of these has a perp under another name, add it to ALIASES in src/bot/dn/core.ts`);
   for (const p of pairs)
     console.log(`  ${p.key.padEnd(8)} perp ${p.perp.symbol.padEnd(14)} swap ${p.swap.symbol.padEnd(14)} swap status ${p.swap.status ?? "?"} · next close ${fmtTime(p.swap.next_close_at)} · margin ${p.swap.margin_modes.join("/")}`);
 
