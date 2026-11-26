@@ -14,8 +14,14 @@ import { OmniClient, OmniError, checkOrder, dec, type Instrument, type Order, ty
 import { SpreadStats, carryBpsPerDay, correlation, discoverPairs, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
 
 const cmd = process.argv[2];
+// Accept "--flag -0.0065" as well as "--flag=-0.0065": node's parseArgs reads a leading "-" as an option.
+const argv: string[] = [];
+for (const x of process.argv.slice(3)) {
+  if (/^-\d|^-\.\d/.test(x) && argv.length && argv[argv.length - 1].startsWith("--") && !argv[argv.length - 1].includes("=")) argv[argv.length - 1] += `=${x}`;
+  else argv.push(x);
+}
 const { values: a } = parseArgs({
-  args: process.argv.slice(3),
+  args: argv,
   options: {
     pair: { type: "string" },
     mode: { type: "string", default: "stat" },
