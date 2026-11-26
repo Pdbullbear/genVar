@@ -7,6 +7,7 @@ A TypeScript toolkit for the **Variational Omni API**, which is in early access 
 | **SDK** (`src/sdk`) | Ed25519 request signing, a typed client for all 16 endpoints, rate-budget tracking, exact price/size rounding, and idempotent order placement | `import { OmniClient } from "omni-kit"` |
 | **MCP server** (`src/mcp`) | Lets Claude read and trade your account in plain English, using a two-step preview → confirm flow | `omni-mcp` |
 | **Dashboard** (`src/tui`) | Live terminal view: mark vs index basis, sparklines, account health, positions, orders, fills, a weight gauge, and a trading command line | `omni-dash` |
+| **Delta-neutral bot** (`src/bot/dn`) | Swap ⇄ perp arbitrage on the same underlying: finds pairs, trades the spread (or harvests funding) with both legs executed as one unit | `omni-dn` |
 | **Grid bot** (`src/bot`) | An example strategy: a ladder of limit orders with an inventory cap, re-quote cooldown, recentering and clean shutdown. Dry run by default | `omni-grid` |
 | **Mock exchange** (`src/mock`) | A local, spec-shaped Omni for development and paper trading. It verifies real signatures and enforces the rate limit | `omni-mock` |
 
@@ -74,6 +75,91 @@ q                              quit
 ```
 
 Each order asks for confirmation (`y`) before it is sent. The poller measures what a refresh cycle really costs, using `X-RateLimit-Remaining`. It then spaces cycles so the dashboard uses at most about 70% of the budget, leaving room for orders. Set `DASH_BUDGET_SHARE` to change that share.
+
+## Delta-neutral swap ⇄ perp bot
+
+Several underlyings (gold, silver, platinum, palladium, US500, and oil, copper and natural gas under
+different codes) trade on Omni both as a **perp** and as a **swap**:
+
+| | Perp | Swap |
+|---|---|---|
+| Hours | 24/7 | Trading hours, closed weekends |
+| Funding | Crypto-style, variable (paid every 1–8h) | TradFi financing (SOFR-like), daily, different long/short rates |
+| Margin | Cross or isolated | Isolated only |
+
+The bot holds equal USD notional long on one and short on the other. Moves in the underlying cancel out,
+which leaves two things to earn:
+- **Spread reversion** (`--mode stat`): the perp/swap price ratio wanders around its average. The bot sells
+  the rich leg and buys the cheap one when the spread is stretched, then exits when it comes back.
+- **Funding carry** (`--mode carry`): the bot holds one direction to collect the funding difference between
+  the legs.
+
+### 1. Scan first
+
+```bash
+npm run dn -- scan --minutes 5
+```
+
+The scan lists every perp/swap pair on your account and shows how each instrument was classified.
+It then samples prices and ranks the pairs by how far the spread swings compared with the cost of
+four fills. **Run this on testnet before anything else:** the API docs don't show how swaps are named,
+so if a pair is missing, add its code to `ALIASES` in `src/bot/dn/core.ts`.
+
+### 2. Dry run, then live
+
+```bash
+npm run dn -- run --pair XAU                                   # paper fills against real prices
+npm run dn -- run --pair XAU --live --notional-usd 500         # trades
+npm run dn -- run --pair XAU --mode carry --dir short_perp \
+  --perp-funding 0.01 --swap-long-funding 0.012 --live         # funding carry
+```
+
+**Funding isn't in the API.** Read each leg's current rates in the Omni app (hover the funding rate)
+and pass them in. They are used to value the carry. Afterwards, check the positions' `cum_funding`;
+the bot prints it while a position is open.
+
+### How it stays safe
+
+- **Paired execution.** Both legs are sent back to back (about 3ms apart against the mock) and confirmed
+  together. If one leg fails, it is retried. If it still fails, the leg that filled is unwound, so the bot
+  never stays one-sided.
+- **Weight reserved for trading.** The bot won't start a pair unless the rate budget covers both legs
+  and the fill checks. When flat, polling only spends weight above that reserve.
+- **Swap hours.** The bot only enters while the swap is open and not close to its close. In stat mode
+  it exits before the swap closes. If the swap is closed when an exit is due, it keeps both legs on
+  (still hedged) rather than closing only the perp.
+- **Clean statistics.** The spread statistics are updated only while the swap is open and its price is
+  fresh, so a closed market's frozen price can't skew them.
+- **Per-cycle risk checks while open:**
+  - each leg's distance to liquidation;
+  - hedge drift, fixed by topping up the perp leg;
+  - a stop-loss on the combined legs' PnL;
+  - a maximum holding time.
+- **State survives restarts.** State lives in `dn-<PAIR>.json`. Ctrl-C leaves an open position on, since
+  it is hedged, and the next run resumes managing it. If the exchange positions don't match the state
+  file, the bot refuses to trade until you fix it.
+
+### Key flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--notional-usd` | 500 | Size of each leg |
+| `--entry-z` / `--exit-z` | 2 / 0.5 | Enter when \|z\| ≥ entry; exit when ≤ exit or the spread crosses its mean |
+| `--round-trip-bps` | 24 | Estimated cost of four fills. Measure it: each fill's slippage is logged in `dn-<PAIR>.jsonl` |
+| `--min-edge-bps` | 5 | Required edge after costs (and expected carry) |
+| `--half-life-min` / `--min-samples` | 60 / 30 | Memory of the spread average, and the warm-up before trading |
+| `--stop-loss-usd` / `--max-hold-hours` | 25 / 24 | Exit limits |
+| `--min-liq-dist-pct` / `--max-drift-pct` | 15 / 5 | Liquidation-distance exit and hedge rebalance trigger |
+| `--flat-before-close-min` | 15 | Stat mode: exit this long before the swap closes, and don't enter within twice that |
+| `--poll` | 10 | Seconds between checks |
+
+Caveats:
+- The swap leg is isolated-margin only. A big move can stress it while the gain sits on the perp leg.
+  Keep notional modest and watch the liquidation-distance exits.
+- The mock's spread dynamics are made up. Whether real perp/swap spreads swing enough to beat costs is
+  exactly what `scan` is for.
+
+The market-making bot that preceded this is parked on the `parked/market-maker` branch.
 
 ## Grid bot
 

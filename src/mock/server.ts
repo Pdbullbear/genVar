@@ -18,7 +18,9 @@ const LEVERAGE = 10;
 const OLP_HALF_SPREAD = Number(process.env.MOCK_OLP_SPREAD_BPS ?? 3) / 1e4;
 
 // ---------- Market ----------
-interface Mkt { inst: Instrument; index: number; basis: number; vol: number; t: number }
+// A swap can be linked to a perp: its index follows the perp's index × ratio × (1 + dev), where dev is
+// a mean-reverting spread. That is the perp/swap dislocation a delta-neutral arb bot trades.
+interface Mkt { inst: Instrument; index: number; basis: number; vol: number; t: number; link?: { perp: string; ratio: number; dev: number } }
 const pp = { min_decimal_figures: 2, max_decimal_only_figures: 5, max_significant_figures: 6 };
 function mkInst(symbol: string, underlying: string, step: string): Instrument {
   return {
@@ -33,14 +35,28 @@ const markets = new Map<string, Mkt>([
   ["SOL-PERP", { inst: mkInst("SOL-PERP", "SOL", "0.01"), index: 180, basis: 0, vol: 0.001, t: Date.now() }],
   ["HYPE-PERP", { inst: mkInst("HYPE-PERP", "HYPE", "0.001"), index: 62, basis: 0, vol: 0.0012, t: Date.now() }],
   ["DOGE-PERP", { inst: mkInst("DOGE-PERP", "DOGE", "1"), index: 0.18, basis: 0, vol: 0.0012, t: Date.now() }],
+  ["XAU-PERP", { inst: mkInst("XAU-PERP", "XAU", "0.0001"), index: 4100, basis: 0, vol: 0.0003, t: Date.now() }],
+  ["US500-PERP", { inst: mkInst("US500-PERP", "US500", "0.001"), index: 690, basis: 0, vol: 0.0003, t: Date.now() }],
+  ["XAU-SWAP", { inst: mkSwap("XAU-SWAP", "XAU", "0.0001"), index: 4100, basis: 0, vol: 0, t: Date.now(), link: { perp: "XAU-PERP", ratio: 1, dev: 0 } }],
+  // Different price level on purpose: an index swap vs an ETF-basket perp need not trade at parity.
+  ["US500-SWAP", { inst: mkSwap("US500-SWAP", "US500", "0.0001"), index: 6900, basis: 0, vol: 0, t: Date.now(), link: { perp: "US500-PERP", ratio: 10, dev: 0 } }],
 ]);
+function mkSwap(symbol: string, underlying: string, step: string): Instrument {
+  // Swaps: isolated margin only and a trading schedule (the mock keeps them open).
+  return { ...mkInst(symbol, underlying, step), margin_modes: ["isolated"], next_close_at: Date.now() + 6 * 3600_000, next_open_at: Date.now() + 7 * 3600_000 };
+}
+const DEV_VOL = Number(process.env.MOCK_SWAP_DEV_BPS ?? 4) / 1e4;
 const mark = (m: Mkt) => m.index * (1 + m.basis);
 const fmt = (m: Mkt, p: number) => roundPrice(p.toFixed(10), m.inst.price_precision);
 
 function tick() {
   for (const m of markets.values()) {
     const z = (Math.random() + Math.random() + Math.random() - 1.5) * 2;
-    m.index *= 1 + z * m.vol;
+    if (m.link) {
+      // Ornstein-Uhlenbeck spread around 0 with ~25s half-life.
+      m.link.dev = m.link.dev * 0.973 + z * DEV_VOL;
+      m.index = markets.get(m.link.perp)!.index * m.link.ratio * (1 + m.link.dev);
+    } else m.index *= 1 + z * m.vol;
     // mean-reverting basis (mark vs index), a few bps
     m.basis = m.basis * 0.9 + (Math.random() - 0.5) * 0.0006;
     m.t = Date.now();
