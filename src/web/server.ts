@@ -16,12 +16,28 @@ import { fileURLToPath } from "node:url";
 import { OmniClient, OmniError, type Ticker } from "../sdk/index.js";
 import { discoverPairs, carryBpsPerDay, pairFunding, type Pair } from "../bot/dn/core.js";
 import { fetchStats } from "../sdk/stats.js";
+import { cookie, createAccessVerifier } from "./access.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const RUNNER = join(ROOT, "dist", "bot", "dn", "runner.js");
 const PORT = Number(process.env.WEB_PORT ?? 8790);
-const TOKEN = process.env.WEB_TOKEN ?? randomBytes(16).toString("hex");
+// The panel token is kept in .web-token so links and the browser cookie survive restarts.
+const TOKEN_FILE = join(ROOT, ".web-token");
+const TOKEN = process.env.WEB_TOKEN ?? (() => {
+  try { const t = readFileSync(TOKEN_FILE, "utf8").trim(); if (/^[0-9a-f]{32,}$/.test(t)) return t; } catch { /* create below */ }
+  const t = randomBytes(24).toString("hex");
+  writeFileSync(TOKEN_FILE, t + "\n", { mode: 0o600 });
+  return t;
+})();
+
+// ---------- remote access through a Cloudflare Tunnel ----------
+// WEB_PUBLIC_HOST is the tunnel's hostname (e.g. desk.example.com). Requests for it must carry a valid
+// Cloudflare Access token (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD); without that config they're refused.
+const PUBLIC_HOST = (process.env.WEB_PUBLIC_HOST ?? "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "") || null;
+const verifyAccess = process.env.CF_ACCESS_TEAM_DOMAIN && process.env.CF_ACCESS_AUD
+  ? createAccessVerifier({ teamDomain: process.env.CF_ACCESS_TEAM_DOMAIN, aud: process.env.CF_ACCESS_AUD })
+  : null;
 const client = new OmniClient({ reserve: 10 });
 
 // ---------- cached exchange data (shared 60 weight/min with the bots, so keep it frugal) ----------
@@ -333,7 +349,7 @@ function startScan(minutes: number) {
 
 // ---------- HTTP ----------
 function authed(req: IncomingMessage, url: URL) {
-  const got = String(req.headers["x-token"] ?? url.searchParams.get("t") ?? "");
+  const got = String(req.headers["x-token"] || url.searchParams.get("t") || cookie(req.headers.cookie, "omni_t") || "");
   const a = Buffer.from(got), b = Buffer.from(TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
 }
@@ -348,14 +364,30 @@ async function body(req: IncomingMessage) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
-  // Block DNS-rebinding: only answer requests addressed to this machine.
-  const host = String(req.headers.host ?? "");
-  if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) return json(res, 403, { error: "bad host" });
+  // Block DNS-rebinding: only answer requests addressed to this machine, or to the tunnel's hostname.
+  const host = String(req.headers.host ?? "").toLowerCase();
+  const local = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
+  const remote = !!PUBLIC_HOST && host === PUBLIC_HOST;
+  if (!local && !remote) return json(res, 403, { error: "bad host" });
+  if (remote) {
+    // Fail closed: a public hostname without Access verification configured is never served.
+    if (!verifyAccess) return json(res, 403, { error: "remote access isn't configured (set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD)" });
+    try {
+      await verifyAccess(String(req.headers["cf-access-jwt-assertion"] ?? "") || cookie(req.headers.cookie, "CF_Authorization"));
+    } catch (e) {
+      return json(res, 403, { error: `Cloudflare Access check failed: ${(e as Error).message}` });
+    }
+  }
   try {
     if (req.method === "GET" && url.pathname === "/") {
       if (!authed(req, url)) return res.writeHead(401, { "content-type": "text/plain" }).end("Open the link printed in the terminal (it includes ?t=…).");
-      return res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" })
-        .end(readFileSync(join(ROOT, "src", "web", "index.html"), "utf8"));
+      // Remember the token in an HttpOnly, same-site cookie so a bookmark without ?t= keeps working.
+      const secure = remote || req.headers["x-forwarded-proto"] === "https";
+      return res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
+        "set-cookie": `omni_t=${TOKEN}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000${secure ? "; Secure" : ""}`,
+        "referrer-policy": "no-referrer", "x-frame-options": "DENY", "x-content-type-options": "nosniff",
+      }).end(readFileSync(join(ROOT, "src", "web", "index.html"), "utf8"));
     }
     if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "not found" });
     if (!authed(req, url)) return json(res, 401, { error: "missing or wrong token" });
@@ -442,6 +474,9 @@ server.listen(PORT, "127.0.0.1", () => {
   }
   console.log(`omni-kit panel (${client.environment}, key ${client.publicKey.slice(0, 10)}…)`);
   console.log(`\n  open:  http://127.0.0.1:${PORT}/?t=${TOKEN}\n`);
+  if (PUBLIC_HOST) console.log(verifyAccess
+    ? `  remote: https://${PUBLIC_HOST}/?t=${TOKEN}  (Cloudflare Access login required)\n`
+    : `  remote: ${PUBLIC_HOST} is REFUSED until CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD are set\n`);
   console.log("Ctrl-C stops the panel and its bots (open DN positions stay on, hedged).");
 });
 const shutdown = () => {

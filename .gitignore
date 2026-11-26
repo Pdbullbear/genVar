@@ -6,3 +6,4 @@ dn-*.jsonl
 mm-*.jsonl
 web-bots.json
 dn-*.cmd
+.web-token
