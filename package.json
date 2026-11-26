@@ -12,6 +12,7 @@
     "omni-dash": "dist/tui/dashboard.js",
     "omni-grid": "dist/bot/grid.js",
     "omni-dn": "dist/bot/dn/runner.js",
+    "omni-web": "dist/web/server.js",
     "omni-mock": "dist/mock/server.js"
   },
   "scripts": {
@@ -21,7 +22,8 @@
     "dash": "node dist/tui/dashboard.js",
     "mcp": "node dist/mcp/server.js",
     "grid": "node dist/bot/grid.js",
-    "dn": "node dist/bot/dn/runner.js"
+    "dn": "node dist/bot/dn/runner.js",
+    "web": "node dist/web/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",

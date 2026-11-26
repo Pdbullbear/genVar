@@ -7,6 +7,7 @@ A TypeScript toolkit for the **Variational Omni API**, which is in early access 
 | **SDK** (`src/sdk`) | Ed25519 request signing, a typed client for all 16 endpoints, rate-budget tracking, exact price/size rounding, and idempotent order placement | `import { OmniClient } from "omni-kit"` |
 | **MCP server** (`src/mcp`) | Lets Claude read and trade your account in plain English, using a two-step preview → confirm flow | `omni-mcp` |
 | **Dashboard** (`src/tui`) | Live terminal view: mark vs index basis, sparklines, account health, positions, orders, fills, a weight gauge, and a trading command line | `omni-dash` |
+| **Web panel** (`src/web`) | Browser control panel: start/stop delta-neutral bots, exit positions, funding-carry calculator, live PnL/spread charts, pairs, positions, scans | `omni-web` |
 | **Delta-neutral bot** (`src/bot/dn`) | Swap ⇄ perp arbitrage on the same underlying: finds pairs, trades the spread (or harvests funding) with both legs executed as one unit | `omni-dn` |
 | **Grid bot** (`src/bot`) | An example strategy: a ladder of limit orders with an inventory cap, re-quote cooldown, recentering and clean shutdown. Dry run by default | `omni-grid` |
 | **Mock exchange** (`src/mock`) | A local, spec-shaped Omni for development and paper trading. It verifies real signatures and enforces the rate limit | `omni-mock` |
@@ -75,6 +76,42 @@ q                              quit
 ```
 
 Each order asks for confirmation (`y`) before it is sent. The poller measures what a refresh cycle really costs, using `X-RateLimit-Remaining`. It then spaces cycles so the dashboard uses at most about 70% of the budget, leaving room for orders. Set `DASH_BUDGET_SHARE` to change that share.
+
+## Web panel
+
+```bash
+npm run web
+```
+
+The terminal prints a link like `http://127.0.0.1:8790/?t=…`. Open it in your browser.
+
+- **Start a bot:**
+  1. Pick a pair.
+  2. Paste the funding rates the Omni app shows, as annual %. The carry calculator shows what each
+     direction earns and its break-even, and selects the better direction.
+  3. Choose a dry run or live, then click Start.
+- **Monitor:** each bot card shows its position, the PnL of both legs, funding received, realized PnL,
+  fill slippage, the swap market's hours, liquidation prices, live charts and the log.
+  The header shows the API weight left.
+- **Act:**
+  - **Stop** stops the bot and leaves a hedged position open; Start again resumes it.
+  - **Exit position** closes both legs together. If rate-limit weight is short, the exit waits and
+    retries; the bot then stops.
+- **Pairs, positions and scans** are on the same page.
+
+Safety:
+- The panel listens on 127.0.0.1 only.
+- Every call needs the token from the link, so other websites can't drive it.
+- The API key stays in the panel's process and never reaches the browser.
+
+The panel and its bots share your key's 60 weight per minute. The bots get priority, so the account
+numbers can take a few seconds to appear.
+
+Bots run inside the panel, so keep it running (e.g. in `tmux`) for as long as they should trade.
+Ctrl-C stops them gracefully, and any open position stays on, hedged.
+
+A carry bot holds once: after any exit it stops, and won't re-enter until you start it again.
+A spread bot keeps trading after normal spread-reversion exits, but stops after a manual or safety exit.
 
 ## Delta-neutral swap ⇄ perp bot
 

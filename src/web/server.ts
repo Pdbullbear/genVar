@@ -1,0 +1,259 @@
+#!/usr/bin/env node
+// Local web control panel for omni-kit: run and monitor the delta-neutral bots from the browser.
+//
+//   npm run web            → prints  http://127.0.0.1:8790/?t=<token>
+//
+// Security: listens on 127.0.0.1 only; every API call must carry the random token printed at startup
+// (so other websites open in your browser can't drive it); the API key never leaves this process.
+// Bots run as child processes of this server: stopping the server with Ctrl-C stops them gracefully
+// (an open DN position stays on, hedged, and resumes the next time its bot starts).
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { OmniClient, OmniError, type Ticker } from "../sdk/index.js";
+import { discoverPairs, carryBpsPerDay, type Pair } from "../bot/dn/core.js";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, "..", "..");
+const RUNNER = join(ROOT, "dist", "bot", "dn", "runner.js");
+const PORT = Number(process.env.WEB_PORT ?? 8790);
+const TOKEN = process.env.WEB_TOKEN ?? randomBytes(16).toString("hex");
+const client = new OmniClient({ reserve: 10 });
+
+// ---------- cached exchange data (shared 60 weight/min with the bots, so keep it frugal) ----------
+type Cached<T> = { at: number; data: T | null; err?: string; inflight?: Promise<void> };
+function cached<T>(ttlMs: number, load: () => Promise<T>) {
+  const c: Cached<T> = { at: 0, data: null };
+  // Never blocks an HTTP response: returns the latest snapshot and refreshes in the background.
+  // (The panel's client waits for rate-limit weight rather than risk a 429, which can take a while
+  // when bots are busy on the same key.)
+  return async (force = false) => {
+    if ((force || Date.now() - c.at > ttlMs) && !c.inflight) {
+      c.inflight = load()
+        .then((d) => { c.data = d; c.err = undefined; })
+        .catch((e) => { c.err = e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : String(e?.message ?? e); })
+        .finally(() => { c.at = Date.now(); c.inflight = undefined; });
+      // Give a fast first load a moment to land in this response.
+      if (!c.data) await Promise.race([c.inflight, new Promise((r) => setTimeout(r, 1500))]);
+    }
+    return { data: c.data, err: c.err, at: c.at, loading: !!c.inflight };
+  };
+}
+const account = cached(20_000, async () => {
+  const [acct, positions] = await Promise.all([client.account(), client.positions()]);
+  return { account: acct, positions: positions.filter((p) => Number(p.size) !== 0) };
+});
+const instruments = cached(300_000, () => client.instruments());
+const tickers = cached(30_000, () => client.tickers());
+async function pairs() {
+  const [i, t] = [await instruments(), await tickers()];
+  const tk = new Map<string, Ticker>((t.data ?? []).map((x) => [x.symbol, x]));
+  const list = discoverPairs(i.data ?? []).map((p: Pair) => {
+    const pm = Number(tk.get(p.perp.symbol)?.mark_price), sm = Number(tk.get(p.swap.symbol)?.mark_price);
+    return {
+      key: p.key, perp: p.perp.symbol, swap: p.swap.symbol, perpMark: pm || null, swapMark: sm || null,
+      gapBps: pm && sm ? +((Math.log(pm / sm)) * 1e4).toFixed(2) : null,
+      swapStatus: p.swap.status, nextClose: p.swap.next_close_at, nextOpen: p.swap.next_open_at,
+    };
+  });
+  return { pairs: list, err: i.err ?? t.err, at: t.at };
+}
+
+// ---------- bots ----------
+interface Bot {
+  pair: string; live: boolean; cfg: any; args: string[]; proc: ChildProcess | null; startedAt: number; exitedAt?: number;
+  exitCode?: number | null; log: string[]; status: any; series: { t: number; dev: number; pnl: number | null }[];
+}
+const bots = new Map<string, Bot>(); // key: PAIR or PAIR-dry
+
+function botKey(pair: string, live: boolean) { return live ? pair : `${pair}-dry`; }
+
+function startBot(cfg: any) {
+  const pair = String(cfg.pair ?? "").toUpperCase();
+  if (!/^[A-Z0-9]{1,15}$/.test(pair)) throw new Error("bad pair");
+  const live = !!cfg.live;
+  const key = botKey(pair, live);
+  const existing = bots.get(key);
+  if (existing?.proc) throw new Error(`${key} bot is already running`);
+  const num = (k: string, v: unknown) => {
+    if (v === undefined || v === null || v === "") return [];
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new Error(`${k} must be a number`);
+    return [`--${k}=${n}`];
+  };
+  const mode = cfg.mode === "carry" ? "carry" : "stat";
+  const args = [RUNNER, "run", "--pair", pair, "--mode", mode, "--status-json",
+    ...(mode === "carry" ? ["--dir", cfg.dir === "short_perp" ? "short_perp" : "long_perp"] : []),
+    ...num("notional-usd", cfg.notionalUsd), ...num("perp-funding", cfg.perpFunding),
+    ...num("swap-long-funding", cfg.swapLongFunding), ...num("swap-short-funding", cfg.swapShortFunding),
+    ...num("hold-hours", cfg.holdHours), ...num("max-hold-hours", cfg.maxHoldHours),
+    ...num("stop-loss-usd", cfg.stopLossUsd), ...num("entry-z", cfg.entryZ), ...num("exit-z", cfg.exitZ),
+    ...num("round-trip-bps", cfg.roundTripBps), ...num("poll", cfg.poll),
+    ...(live ? ["--live"] : [])];
+  const proc = spawn(process.execPath, args, { cwd: ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  const bot: Bot = { pair, live, cfg, args: args.slice(1), proc, startedAt: Date.now(), log: [], status: existing?.status ?? null, series: existing?.series ?? [] };
+  bots.set(key, bot);
+  const onLine = (line: string) => {
+    if (!line.trim()) return;
+    if (line.startsWith("@@")) {
+      try {
+        bot.status = JSON.parse(line.slice(2));
+        bot.series.push({ t: bot.status.t, dev: bot.status.devBps, pnl: bot.status.trade?.pnl ?? null });
+        if (bot.series.length > 720) bot.series.shift();
+      } catch { /* ignore */ }
+      return;
+    }
+    bot.log.push(line);
+    if (bot.log.length > 300) bot.log.shift();
+  };
+  let buf = "";
+  const feed = (d: Buffer) => { buf += d.toString(); const parts = buf.split("\n"); buf = parts.pop()!; parts.forEach(onLine); };
+  proc.stdout!.on("data", feed);
+  proc.stderr!.on("data", feed);
+  proc.on("exit", (code) => { bot.proc = null; bot.exitedAt = Date.now(); bot.exitCode = code; onLine(`— bot exited (${code}) —`); });
+  return key;
+}
+
+function stopBot(key: string) {
+  const b = bots.get(key);
+  if (!b?.proc) throw new Error(`${key} is not running`);
+  b.proc.kill("SIGINT"); // graceful: finishes the cycle, saves state, leaves a hedged position on
+}
+
+function stateFile(pair: string, live: boolean) { return join(ROOT, `dn-${pair}${live ? "" : "-dry"}.json`); }
+
+function requestExit(key: string) {
+  const b = bots.get(key);
+  if (!b?.proc) throw new Error(`${key} is not running: start it, then exit (the bot closes both legs together)`);
+  writeFileSync(stateFile(b.pair, b.live).replace(/\.json$/, ".cmd"), "exit");
+}
+
+/** State files on disk, including ones from bots that aren't running (e.g. started from a terminal). */
+function savedStates() {
+  return readdirSync(ROOT).filter((f) => /^dn-[A-Z0-9]+(-dry)?\.json$/.test(f)).map((f) => {
+    try {
+      const s = JSON.parse(readFileSync(join(ROOT, f), "utf8"));
+      const m = f.match(/^dn-([A-Z0-9]+)(-dry)?\.json$/)!;
+      return { file: f, pair: m[1], live: !m[2], trade: s.trade, realizedUsd: s.realizedUsd, trades: s.trades, samples: s.stats?.n ?? 0 };
+    } catch { return null; }
+  }).filter(Boolean);
+}
+
+function recentEvents(pair: string, live: boolean, n = 50) {
+  const f = stateFile(pair, live).replace(/\.json$/, ".jsonl");
+  if (!existsSync(f)) return [];
+  return readFileSync(f, "utf8").trim().split("\n").slice(-n).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+// ---------- scan jobs ----------
+let scan: { running: boolean; startedAt: number; minutes: number; result: any; err?: string; proc?: ChildProcess } | null = null;
+function startScan(minutes: number) {
+  if (scan?.running) throw new Error("a scan is already running");
+  const m = Math.min(10, Math.max(0.5, minutes || 2));
+  const proc = spawn(process.execPath, [RUNNER, "scan", "--json", `--minutes=${m}`], { cwd: ROOT, env: process.env });
+  let out = "", err = "";
+  scan = { running: true, startedAt: Date.now(), minutes: m, result: null, proc };
+  proc.stdout.on("data", (d) => (out += d));
+  proc.stderr.on("data", (d) => (err += d));
+  proc.on("exit", () => {
+    const i = out.indexOf("\n[");
+    try { scan!.result = JSON.parse(out.slice(i + 1)); } catch { scan!.err = (err || out).slice(-500); }
+    scan!.running = false;
+  });
+}
+
+// ---------- HTTP ----------
+function authed(req: IncomingMessage, url: URL) {
+  const got = String(req.headers["x-token"] ?? url.searchParams.get("t") ?? "");
+  const a = Buffer.from(got), b = Buffer.from(TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+const json = (res: ServerResponse, code: number, body: unknown) =>
+  res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(body));
+
+async function body(req: IncomingMessage) {
+  let s = "";
+  for await (const c of req) { s += c; if (s.length > 20_000) throw new Error("body too large"); }
+  return s ? JSON.parse(s) : {};
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
+  // Block DNS-rebinding: only answer requests addressed to this machine.
+  const host = String(req.headers.host ?? "");
+  if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) return json(res, 403, { error: "bad host" });
+  try {
+    if (req.method === "GET" && url.pathname === "/") {
+      if (!authed(req, url)) return res.writeHead(401, { "content-type": "text/plain" }).end("Open the link printed in the terminal (it includes ?t=…).");
+      return res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" })
+        .end(readFileSync(join(ROOT, "src", "web", "index.html"), "utf8"));
+    }
+    if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "not found" });
+    if (!authed(req, url)) return json(res, 401, { error: "missing or wrong token" });
+    // State-changing calls must come from our own page (no cross-site form posts).
+    if (req.method === "POST" && req.headers["content-type"] !== "application/json") return json(res, 415, { error: "json only" });
+
+    const p = url.pathname;
+    if (req.method === "GET" && p === "/api/overview") {
+      const a = await account();
+      return json(res, 200, {
+        env: client.environment, baseUrl: client.baseUrl, key: client.publicKey.slice(0, 10) + "…",
+        account: a.data?.account ?? null, positions: a.data?.positions ?? [], err: a.err, at: a.at,
+        weight: client.budget.remaining, limit: client.budget.limit,
+      });
+    }
+    if (req.method === "GET" && p === "/api/pairs") return json(res, 200, await pairs());
+    if (req.method === "GET" && p === "/api/bots") {
+      const list = [...bots.entries()].map(([key, b]) => ({
+        key, pair: b.pair, live: b.live, cfg: b.cfg, running: !!b.proc, startedAt: b.startedAt, exitedAt: b.exitedAt, exitCode: b.exitCode,
+        args: b.args.slice(2).join(" "), status: b.status, series: b.series, log: b.log.slice(-80), events: recentEvents(b.pair, b.live, 40),
+      }));
+      return json(res, 200, { bots: list, saved: savedStates() });
+    }
+    if (req.method === "POST" && p === "/api/bots/start") return json(res, 200, { key: startBot(await body(req)) });
+    if (req.method === "POST" && p === "/api/bots/restart") {
+      const b = bots.get(String((await body(req)).key));
+      if (!b) throw new Error("unknown bot");
+      return json(res, 200, { key: startBot(b.cfg) });
+    }
+    if (req.method === "POST" && p === "/api/bots/stop") return (stopBot(String((await body(req)).key)), json(res, 200, { ok: true }));
+    if (req.method === "POST" && p === "/api/bots/exit") return (requestExit(String((await body(req)).key)), json(res, 200, { ok: true }));
+    if (req.method === "POST" && p === "/api/bots/forget") {
+      const k = String((await body(req)).key);
+      if (bots.get(k)?.proc) throw new Error("stop it first");
+      bots.delete(k);
+      return json(res, 200, { ok: true });
+    }
+    if (req.method === "POST" && p === "/api/carry") {
+      // Carry calculator: rates as the app shows them (APR %), converted to the bot's units.
+      const b = await body(req);
+      const f = { perpPct8h: Number(b.perpApr) / 365 / 3, swapLongPctDay: Number(b.swapLongPayApr) / 365, swapShortPctDay: -Number(b.swapShortReceiveApr) / 365 };
+      const day = { short_perp: carryBpsPerDay("short_perp", f), long_perp: carryBpsPerDay("long_perp", f) };
+      return json(res, 200, { ...f, bpsPerDay: day, aprPct: { short_perp: (day.short_perp * 365) / 100, long_perp: (day.long_perp * 365) / 100 } });
+    }
+    if (req.method === "POST" && p === "/api/scan") return (startScan(Number((await body(req)).minutes)), json(res, 200, { ok: true }));
+    if (req.method === "GET" && p === "/api/scan") return json(res, 200, scan ? { ...scan, proc: undefined } : null);
+    return json(res, 404, { error: "not found" });
+  } catch (e) {
+    return json(res, 400, { error: (e as Error).message });
+  }
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`omni-kit panel (${client.environment}, key ${client.publicKey.slice(0, 10)}…)`);
+  console.log(`\n  open:  http://127.0.0.1:${PORT}/?t=${TOKEN}\n`);
+  console.log("Ctrl-C stops the panel and its bots (open DN positions stay on, hedged).");
+});
+const shutdown = () => {
+  for (const b of bots.values()) b.proc?.kill("SIGINT");
+  scan?.proc?.kill("SIGINT");
+  setTimeout(() => process.exit(0), 4000).unref();
+  if (![...bots.values()].some((b) => b.proc)) process.exit(0);
+  let left = [...bots.values()].filter((b) => b.proc).length;
+  for (const b of bots.values()) b.proc?.on("exit", () => { if (--left <= 0) process.exit(0); });
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

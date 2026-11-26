@@ -9,7 +9,7 @@
 // Execution is leg-safe: the swap leg (the one with trading hours) always goes first; if the perp leg
 // then fails, the swap leg is unwound. Safety checks run every cycle while a position is open.
 import { parseArgs } from "node:util";
-import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { OmniClient, OmniError, checkOrder, dec, type Instrument, type Order, type Position, type Ticker } from "../../sdk/index.js";
 import { SpreadStats, carryBpsPerDay, correlation, discoverPairs, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
 
@@ -47,6 +47,7 @@ const { values: a } = parseArgs({
     minutes: { type: "string", default: "3" },
     every: { type: "string", default: "15" },
     state: { type: "string" },
+    "status-json": { type: "boolean", default: false },
     live: { type: "boolean", default: false },
     json: { type: "boolean", default: false },
   },
@@ -288,9 +289,21 @@ async function exit(why: string, pm: number, sm: number, swapOpen: boolean) {
   log("exit", { why, pnl, heldMin: (Date.now() - t.openedAt) / 60000 });
   state.trade = null;
   save();
+  // Carry mode is a single hold: after any exit, stay flat. Stat mode keeps trading after a normal
+  // reversion exit, but a manual or safety exit (stop loss, liquidation distance, max hold, swap
+  // closing) stops it too, so it can't walk straight back into the same loss.
+  const routine = a.mode === "stat" && why.startsWith("spread reverted");
+  if (!routine) {
+    say(`stopping after this exit (${a.mode === "carry" ? "carry mode holds once" : "manual/safety exit"}); start the bot again to re-enter`);
+    halt = true;
+  }
 }
+let halt = false;
+let exitRequested = false;
 
 let cycleN = 0;
+let lastFunding: { perp: number; swap: number; at: number } | null = null;
+let lastLiq: { perp: string | null; swap: string | null } | null = null;
 let carryWarned = 0;
 async function cycle() {
   const [pi, si] = [await inst(pair.perp.symbol), await inst(pair.swap.symbol)];
@@ -317,6 +330,8 @@ async function cycle() {
       }
     }
     const fund = Number(pp.cum_funding) + Number(ps.cum_funding);
+    lastFunding = { perp: Number(pp.cum_funding), swap: Number(ps.cum_funding), at: Date.now() };
+    lastLiq = { perp: pp.liquidation_price, swap: ps.liquidation_price };
     if (cycleN % 30 === 0) say(`funding so far: perp ${pp.cum_funding}$ + swap ${ps.cum_funding}$ = ${fund.toFixed(4)}$`);
     // Hedge drift: price moves change each leg's USD exposure; top up the perp leg (24/7) to re-neutralise.
     const net = Number(pp.size) * pm + Number(ps.size) * sm, gross = Math.abs(Number(pp.size) * pm) + Math.abs(Number(ps.size) * sm);
@@ -330,6 +345,15 @@ async function cycle() {
       }
     }
   }
+  // Manual exit requested (e.g. from the web panel): write "exit" into dn-<PAIR>.cmd.
+  const cmdPath = statePath.replace(/\.json$/, ".cmd");
+  if (existsSync(cmdPath)) {
+    const c = readFileSync(cmdPath, "utf8").trim();
+    unlinkSync(cmdPath);
+    if (c === "exit" && t) exitRequested = true;
+  }
+  // Sticky: if the exit is deferred (e.g. waiting for rate-limit weight), keep trying every cycle.
+  if (exitRequested && t) return exit("manual exit requested", pm, sm, swapOpen);
   if (t) {
     const pnl = legsPnl(t, pm, sm);
     if (pnl < -+a["stop-loss-usd"]!) return exit(`stop loss ${pnl.toFixed(2)}$`, pm, sm, swapOpen);
@@ -355,6 +379,16 @@ async function cycle() {
   say(`${pair.key} perp ${pm} swap ${sm} | dev ${sig.devBps >= 0 ? "+" : ""}${sig.devBps.toFixed(1)}bp z ${sig.z.toFixed(2)} σ ${stats.stdBps().toFixed(1)}bp n${stats.n} | ` +
     (tr ? `OPEN ${tr.dir} pnl ${legsPnl(tr, pm, sm).toFixed(2)}$ ` : `${sig.reason} `) +
     `| swap ${swapOpen ? "open" : si.status}${Number.isFinite(minsToClose) ? `, closes in ${(minsToClose / 60).toFixed(1)}h` : ""} | w ${client.budget.remaining}/${client.budget.limit}`);
+  if (a["status-json"]) {
+    console.log("@@" + JSON.stringify({
+      t: Date.now(), pair: pair.key, perp: pair.perp.symbol, swap: pair.swap.symbol, pm, sm, mode: a.mode, live: LIVE,
+      devBps: +sig.devBps.toFixed(2), z: +sig.z.toFixed(3), stdBps: +stats.stdBps().toFixed(2), n: stats.n, signal: sig.reason,
+      swapStatus: swapOpen ? "open" : si.status, minsToClose: Number.isFinite(minsToClose) ? Math.round(minsToClose) : null,
+      trade: tr ? { ...tr, pnl: +legsPnl(tr, pm, sm).toFixed(4) } : null,
+      realizedUsd: state.realizedUsd, trades: state.trades, funding: lastFunding, liq: lastLiq, exitPending: exitRequested,
+      weight: client.budget.remaining, limit: client.budget.limit,
+    }));
+  }
   if (cycleN % 6 === 0) save();
 }
 
@@ -402,6 +436,7 @@ async function run() {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   for (;;) {
+    if (halt) return stop();
     current = cycle().catch((e) => say(`error: ${e instanceof OmniError ? `${e.code}: ${e.body.error_message}` : (e as Error).message}`));
     await current;
     cycleN++;
