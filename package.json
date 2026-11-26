@@ -27,7 +27,9 @@
     "dn": "node dist/bot/dn/runner.js",
     "web": "node dist/web/server.js",
     "web:remote": "node scripts/web-remote.mjs",
-    "tunnel:setup": "node scripts/cloudflare-setup.mjs"
+    "tunnel:setup": "node scripts/cloudflare-setup.mjs",
+    "web:quick": "node scripts/web-quick.mjs",
+    "web:password": "node scripts/set-password.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",

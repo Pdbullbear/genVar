@@ -178,6 +178,7 @@ pre { margin: 8px 0 0; max-height: 240px; overflow: auto; background: var(--bg);
     <div class="gauge" title="API weight left in the 60-second window (shared by the panel and all bots)">
       <span class="gl">weight</span> <div class="track"><div id="wfill" class="fill" style="width:0"></div></div> <span id="wtxt">–</span>
     </div>
+    <form method="post" action="/logout" id="logoutForm" style="display:none; margin:0"><button class="small" type="submit">Log out</button></form>
     <button class="small" id="theme" title="Toggle light/dark" aria-label="Toggle light/dark"><svg width="14" height="14" viewBox="0 0 14 14"><circle cx="7" cy="7" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 1a6 6 0 0 1 0 12z" fill="currentColor"/></svg></button>
   </div>
 </header>
@@ -316,6 +317,9 @@ async function api(path, body) {
   return j;
 }
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), 3200); }
+
+// Remote (password) sessions get a log-out button; local use doesn't need one.
+if (!/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) $("#logoutForm").style.display = "";
 
 // ---------- theme ----------
 try { const th = localStorage.getItem("theme"); if (th) document.documentElement.dataset.theme = th; } catch {}

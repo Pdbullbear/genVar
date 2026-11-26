@@ -17,6 +17,7 @@ import { OmniClient, OmniError, type Ticker } from "../sdk/index.js";
 import { discoverPairs, carryBpsPerDay, pairFunding, type Pair } from "../bot/dn/core.js";
 import { fetchStats } from "../sdk/stats.js";
 import { cookie, createAccessVerifier } from "./access.js";
+import { LoginLimiter, Sessions, loginPage, verifyPassword } from "./password.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -35,6 +36,12 @@ const TOKEN = process.env.WEB_TOKEN ?? (() => {
 // WEB_PUBLIC_HOST is the tunnel's hostname (e.g. desk.example.com). Requests for it must carry a valid
 // Cloudflare Access token (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD); without that config they're refused.
 const PUBLIC_HOST = (process.env.WEB_PUBLIC_HOST ?? "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "") || null;
+// Without Cloudflare Access (e.g. a free quick tunnel), WEB_AUTH=password requires a password login
+// for the public hostname instead. The hash lives in .web-password (npm run web:password).
+const PASSWORD_FILE = process.env.WEB_PASSWORD_FILE ?? join(ROOT, ".web-password");
+const passwordHash = process.env.WEB_AUTH === "password" && existsSync(PASSWORD_FILE) ? readFileSync(PASSWORD_FILE, "utf8").trim() : null;
+const sessions = new Sessions();
+const limiter = new LoginLimiter();
 const verifyAccess = process.env.CF_ACCESS_TEAM_DOMAIN && process.env.CF_ACCESS_AUD
   ? createAccessVerifier({ teamDomain: process.env.CF_ACCESS_TEAM_DOMAIN, aud: process.env.CF_ACCESS_AUD })
   : null;
@@ -369,18 +376,57 @@ const server = createServer(async (req, res) => {
   const local = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
   const remote = !!PUBLIC_HOST && host === PUBLIC_HOST;
   if (!local && !remote) return json(res, 403, { error: "bad host" });
+  let sessionOk = false;
   if (remote) {
-    // Fail closed: a public hostname without Access verification configured is never served.
-    if (!verifyAccess) return json(res, 403, { error: "remote access isn't configured (set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD)" });
-    try {
-      await verifyAccess(String(req.headers["cf-access-jwt-assertion"] ?? "") || cookie(req.headers.cookie, "CF_Authorization"));
-    } catch (e) {
-      return json(res, 403, { error: `Cloudflare Access check failed: ${(e as Error).message}` });
+    res.setHeader("strict-transport-security", "max-age=31536000");
+    if (verifyAccess) {
+      try {
+        await verifyAccess(String(req.headers["cf-access-jwt-assertion"] ?? "") || cookie(req.headers.cookie, "CF_Authorization"));
+      } catch (e) {
+        return json(res, 403, { error: `Cloudflare Access check failed: ${(e as Error).message}` });
+      }
+    } else if (passwordHash) {
+      // ---- password login (quick-tunnel mode) ----
+      const ip = String(req.headers["cf-connecting-ip"] ?? req.socket.remoteAddress ?? "?");
+      const page = (code: number, msg = "") => res.writeHead(code, {
+        "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "referrer-policy": "no-referrer",
+      }).end(loginPage(msg));
+      if (url.pathname === "/login" && req.method === "POST") {
+        const wait = limiter.check(ip);
+        if (wait) return page(429, `Too many attempts. Try again in ${Math.ceil(wait / 60)} min.`);
+        let raw = "";
+        for await (const c of req) { raw += c; if (raw.length > 4096) return page(413, "Request too large."); }
+        const pw = new URLSearchParams(raw).get("password") ?? "";
+        if (!verifyPassword(pw, passwordHash)) {
+          limiter.fail(ip);
+          console.log(`[login] failed attempt from ${ip}`);
+          return page(401, "Wrong password.");
+        }
+        limiter.succeed(ip);
+        const s = sessions.create();
+        console.log(`[login] new session from ${ip}`);
+        return res.writeHead(303, {
+          location: "/",
+          "set-cookie": [`omni_s=${s.id}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${s.maxAgeSec}`],
+        }).end();
+      }
+      if (url.pathname === "/logout" && req.method === "POST") {
+        sessions.destroy(cookie(req.headers.cookie, "omni_s"));
+        return res.writeHead(303, { location: "/login", "set-cookie": "omni_s=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0" }).end();
+      }
+      sessionOk = sessions.valid(cookie(req.headers.cookie, "omni_s"));
+      if (!sessionOk) {
+        if (req.method === "GET" && !url.pathname.startsWith("/api/")) return page(200);
+        return json(res, 401, { error: "log in first" });
+      }
+    } else {
+      // Fail closed: a public hostname with no login configured is never served.
+      return json(res, 403, { error: "remote access isn't configured (Cloudflare Access or WEB_AUTH=password with a password set)" });
     }
   }
   try {
     if (req.method === "GET" && url.pathname === "/") {
-      if (!authed(req, url)) return res.writeHead(401, { "content-type": "text/plain" }).end("Open the link printed in the terminal (it includes ?t=…).");
+      if (!sessionOk && !authed(req, url)) return res.writeHead(401, { "content-type": "text/plain" }).end("Open the link printed in the terminal (it includes ?t=…).");
       // Remember the token in an HttpOnly, same-site cookie so a bookmark without ?t= keeps working.
       const secure = remote || req.headers["x-forwarded-proto"] === "https";
       return res.writeHead(200, {
@@ -390,7 +436,7 @@ const server = createServer(async (req, res) => {
       }).end(readFileSync(join(ROOT, "src", "web", "index.html"), "utf8"));
     }
     if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "not found" });
-    if (!authed(req, url)) return json(res, 401, { error: "missing or wrong token" });
+    if (!sessionOk && !authed(req, url)) return json(res, 401, { error: "missing or wrong token" });
     // State-changing calls must come from our own page (no cross-site form posts).
     if (req.method === "POST" && req.headers["content-type"] !== "application/json") return json(res, 415, { error: "json only" });
 
@@ -476,7 +522,8 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`\n  open:  http://127.0.0.1:${PORT}/?t=${TOKEN}\n`);
   if (PUBLIC_HOST) console.log(verifyAccess
     ? `  remote: https://${PUBLIC_HOST}/?t=${TOKEN}  (Cloudflare Access login required)\n`
-    : `  remote: ${PUBLIC_HOST} is REFUSED until CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD are set\n`);
+    : passwordHash ? `  remote: https://${PUBLIC_HOST}/  (password login required)\n`
+    : `  remote: ${PUBLIC_HOST} is REFUSED: no login configured (Cloudflare Access, or WEB_AUTH=password + npm run web:password)\n`);
   console.log("Ctrl-C stops the panel and its bots (open DN positions stay on, hedged).");
 });
 const shutdown = () => {

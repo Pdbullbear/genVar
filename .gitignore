@@ -9,3 +9,4 @@ dn-*.cmd
 .web-token
 .env.tunnel
 .tunnel-token
+.web-password

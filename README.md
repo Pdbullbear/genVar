@@ -180,6 +180,26 @@ This starts the panel and the tunnel together; Ctrl-C stops both.
   (e.g. on your phone).
 - The panel token is kept in `.web-token`. Delete that file to rotate the token.
 
+## Reach the panel without a domain (free Cloudflare quick tunnel)
+
+No domain or Cloudflare account setup is needed, only
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+
+```bash
+npm run web:password   # once: set a password (12+ characters; typing isn't shown)
+npm run web:quick      # starts the quick tunnel and the panel; Ctrl-C stops both
+```
+- It prints `https://<random-words>.trycloudflare.com`. Open that link and log in with your password.
+  The address changes every time you start it.
+- The panel only answers that exact address remotely, and only after a password login.
+- The password is stored only as a salted scrypt hash in `.web-password`.
+- Sessions last 12 hours, held in a secure, same-site-only cookie. There's a "Log out" button.
+- Brute-force protection: 5 wrong passwords from one address lock it out for 15 minutes; 20 failures
+  in an hour lock remote login for an hour. Local access at `127.0.0.1` keeps working throughout.
+
+Quick tunnels are offered by Cloudflare for testing, with no uptime guarantee. For a stable address
+with Cloudflare's email-code login in front, use the domain setup above.
+
 ## Delta-neutral swap ⇄ perp bot
 
 Several underlyings (gold, silver, platinum, palladium, US500, and oil, copper and natural gas under
