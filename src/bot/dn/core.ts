@@ -14,7 +14,8 @@ export type Kind = "perp" | "swap";
 /** Swap products sometimes use a different code from the perp on the same underlying. */
 export const ALIASES: Record<string, string> = {
   USOIL: "CL", WTI: "CL", UKOIL: "BZ", BRENT: "BZ", COPP: "COPPER", NTGAS: "NATGAS",
-  GOLD: "XAU", SILVER: "XAG", SPX: "US500",
+  GOLD: "XAU", SILVER: "XAG",
+  // Deliberately no SPX → US500: on Omni, SPX-PERP is the SPX6900 token, not the S&P 500.
 };
 export const canonical = (u: string) => {
   const k = u.toUpperCase().replace(/[-_/ ]?(USD|USDC|PERP|SWAP)$/, "");
@@ -40,14 +41,26 @@ export interface Pair {
   swap: Instrument;
 }
 
+/** Pearson correlation of two equal-length series (NaN if undefined). */
+export function correlation(x: number[], y: number[]) {
+  const n = Math.min(x.length, y.length);
+  if (n < 3) return NaN;
+  const mx = x.slice(0, n).reduce((s, v) => s + v, 0) / n, my = y.slice(0, n).reduce((s, v) => s + v, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) { sxy += (x[i] - mx) * (y[i] - my); sxx += (x[i] - mx) ** 2; syy += (y[i] - my) ** 2; }
+  return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : NaN;
+}
+
 export function discoverPairs(insts: Instrument[]): Pair[] {
   const by = new Map<string, { perp?: Instrument; swap?: Instrument }>();
   for (const i of insts) {
     const key = canonical(i.underlying || i.symbol);
     const slot = by.get(key) ?? {};
     const k = kindOf(i);
-    // Prefer an instrument that isn't delisting if there are duplicates.
-    if (!slot[k] || (slot[k]!.scheduled_delist_at && !i.scheduled_delist_at)) slot[k] = i;
+    // Several instruments can map to one key: prefer the one named after the key itself
+    // (US500-PERP over an aliased symbol), then one that isn't being delisted.
+    const score = (x: Instrument) => (x.symbol.toUpperCase().split("-")[0] === key ? 2 : 0) + (x.scheduled_delist_at ? 0 : 1);
+    if (!slot[k] || score(i) > score(slot[k]!)) slot[k] = i;
     by.set(key, slot);
   }
   return [...by.entries()]

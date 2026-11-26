@@ -11,7 +11,7 @@
 import { parseArgs } from "node:util";
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { OmniClient, OmniError, checkOrder, dec, type Instrument, type Order, type Position, type Ticker } from "../../sdk/index.js";
-import { SpreadStats, carryBpsPerDay, discoverPairs, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
+import { SpreadStats, carryBpsPerDay, correlation, discoverPairs, kindOf, signal, type Dir, type Funding, type Pair, type SignalParams } from "./core.js";
 
 const cmd = process.argv[2];
 const { values: a } = parseArgs({
@@ -98,21 +98,27 @@ async function scan() {
     const last = xs.at(-1);
     const dev = r.length ? (r.at(-1)! - mean) * 1e4 : NaN;
     const maxDev = r.length ? Math.max(...r.map((v) => Math.abs(v - mean) * 1e4)) : NaN;
+    // A hedge only works if the legs move together: check the correlation of their returns.
+    const ret = (k: "perp" | "swap") => xs.slice(1).map((x, i) => Math.log(x[k] / xs[i][k]));
+    const corr = correlation(ret("perp"), ret("swap"));
+    const moved = ret("perp").some((v) => v !== 0) && ret("swap").some((v) => v !== 0);
     return {
       pair: p.key, perp: p.perp.symbol, swap: p.swap.symbol, swapStatus: p.swap.status,
       perpMark: last?.perp ?? null, swapMark: last?.swap ?? null,
       levelRatio: last ? +(last.perp / last.swap).toPrecision(6) : null,
+      corr: Number.isFinite(corr) ? +corr.toFixed(2) : null,
       spreadStdBps: +sd.toFixed(2), lastDevBps: +dev.toFixed(2), maxDevBps: +maxDev.toFixed(2), samples: r.length,
       // A spread can pay only if its swings are large relative to the cost of four fills.
-      verdict: !r.length ? "no prices" : p.swap.status !== "open" ? "swap closed" : maxDev > cost ? "tradable swings" : sd * 2 > cost / 2 ? "marginal" : "too tight for costs",
+      verdict: !r.length ? "no prices" : p.swap.status !== "open" ? "swap closed" :
+        moved && Number.isFinite(corr) && corr < 0.6 ? "NOT A HEDGE: legs don't move together" : maxDev > cost ? "tradable swings" : sd * 2 > cost / 2 ? "marginal" : "too tight for costs",
     };
   });
   rows.sort((x, y) => (y.maxDevBps || 0) - (x.maxDevBps || 0));
   console.log("\n");
   if (a.json) return console.log(JSON.stringify(rows, null, 2));
-  console.log("PAIR      PERP MARK      SWAP MARK    PERP/SWAP   SPREAD σ   MAX |DEV|   NOW      VERDICT");
+  console.log("PAIR      PERP MARK      SWAP MARK    PERP/SWAP   CORR   SPREAD σ   MAX |DEV|   NOW      VERDICT");
   for (const r of rows)
-    console.log(`${r.pair.padEnd(8)} ${String(r.perpMark ?? "-").padStart(10)} ${String(r.swapMark ?? "-").padStart(14)} ${String(r.levelRatio ?? "-").padStart(11)} ` +
+    console.log(`${r.pair.padEnd(8)} ${String(r.perpMark ?? "-").padStart(10)} ${String(r.swapMark ?? "-").padStart(14)} ${String(r.levelRatio ?? "-").padStart(11)} ${String(r.corr ?? "-").padStart(6)} ` +
       `${(r.spreadStdBps + "bp").padStart(9)} ${(r.maxDevBps + "bp").padStart(10)} ${((r.lastDevBps >= 0 ? "+" : "") + r.lastDevBps + "bp").padStart(8)}   ${r.verdict}`);
   console.log(`\nCosts assumed: ${cost}bp per round trip (4 fills; set --round-trip-bps). Funding isn't in the API: check each pair's perp and swap funding in the app.`);
   console.log(`Weight used: ${60 - (client.budget.remaining ?? 60)}/60 at the end · learned costs ${JSON.stringify(Object.fromEntries(client.costs))}`);
@@ -354,6 +360,12 @@ async function run() {
   const found = pairs.find((p) => p.key === a.pair!.toUpperCase() || p.perp.symbol === a.pair!.toUpperCase() || p.swap.symbol === a.pair!.toUpperCase());
   if (!found) throw new Error(`no perp/swap pair "${a.pair}". Available: ${pairs.map((p) => p.key).join(", ") || "none"}`);
   pair = found;
+  // Guard against a mis-paired hedge (e.g. a token that shares a ticker with an index).
+  {
+    const tk = new Map((await client.tickers()).map((t) => [t.symbol, Number(t.mark_price)]));
+    const ratio = (tk.get(pair.perp.symbol) ?? NaN) / (tk.get(pair.swap.symbol) ?? NaN);
+    if (!(ratio > 0.02 && ratio < 50)) throw new Error(`${pair.perp.symbol} and ${pair.swap.symbol} trade at a ${ratio.toPrecision(3)} price ratio: probably not the same asset. Run \`scan\` and check the CORR column.`);
+  }
   statePath = a.state ?? `dn-${pair.key}${LIVE ? "" : "-dry"}.json`;
   const halfLife = +a["half-life-min"]! * 60;
   const saved = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;

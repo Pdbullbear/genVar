@@ -22,6 +22,17 @@ test("pairs by underlying, including aliased codes", () => {
   assert.deepEqual(pairs.map((p) => [p.key, p.perp.symbol, p.swap.symbol]), [["CL", "CL-PERP", "USOIL"], ["XAU", "XAU-PERP", "XAU"]]);
 });
 
+test("SPX-PERP (a token) is not paired with the US500 swap; US500-PERP is preferred", () => {
+  const pairs = discoverPairs([
+    inst("SPX-PERP", "SPX"), inst("US500-SWAP", "US500", { margin_modes: ["isolated"] }),
+  ]);
+  assert.equal(pairs.length, 0);
+  const p2 = discoverPairs([
+    inst("SPX6900-PERP", "US500"), inst("US500-PERP", "US500"), inst("US500-SWAP", "US500", { margin_modes: ["isolated"] }),
+  ]);
+  assert.equal(p2[0].perp.symbol, "US500-PERP");
+});
+
 test("spread stats work on log ratio, so different price levels are fine", () => {
   const s = new SpreadStats(60);
   for (let i = 0; i < 200; i++) s.update(Math.log(690 / 6900) + (i % 2 ? 1 : -1) * 0.001, i * 1000);
