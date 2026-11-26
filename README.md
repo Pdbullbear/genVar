@@ -185,7 +185,9 @@ With auto funding, the bot:
 - takes the round-trip cost from the quoted bid/ask spreads;
 - in carry mode, only enters while carry for the chosen direction is positive;
 - with `--exit-if-negative-carry-hours N`, exits (and pauses entries) once carry has stayed negative
-  for N hours.
+  for N hours. Fractions work: `0.5` means 30 minutes. The panel takes hours and minutes. The timer
+  starts at the first 15-minute rate check that shows negative carry and resets if a later check
+  shows it positive again. `0` means never: the bot only warns.
 
 The rates need two corrections:
 - **Weekend payments.** Swap payments that cover a weekend are published at about 3× the daily rate,

@@ -348,6 +348,8 @@ let auto: PairFunding | null = null;
 let autoAt = 0;
 let autoErr: string | null = null;
 let negativeSince: number | null = null;
+/** 1.5 → "1h 30m", 0.25 → "15m" (the setting accepts fractional hours, e.g. from the panel's minutes field). */
+const fmtHours = (h: number) => { const m = Math.round(h * 60); return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}`; };
 let lastEntryNote: string | null = null;
 
 /** With --auto-funding, pull rates and quoted spreads from the public stats feed every 15 minutes. */
@@ -434,7 +436,7 @@ async function cycle() {
     if (c < 0) {
       if (!negativeSince) { negativeSince = Date.now(); say(`warning: carry for ${dir} turned negative (${(c * 100).toFixed(2)}%/yr)`); }
       const hrs = +a["exit-if-negative-carry-hours"]!;
-      if (t && hrs > 0 && Date.now() - negativeSince > hrs * 3.6e6) return exit(`carry negative for ${hrs}h (${(c * 100).toFixed(2)}%/yr)`, pm, sm, swapOpen);
+      if (t && hrs > 0 && Date.now() - negativeSince > hrs * 3.6e6) return exit(`carry negative for ${fmtHours(hrs)} (${(c * 100).toFixed(2)}%/yr)`, pm, sm, swapOpen);
     } else if (negativeSince) { negativeSince = null; say(`carry for ${dir} is positive again (${(c * 100).toFixed(2)}%/yr)`); }
   }
   // Sticky: if the exit is deferred (e.g. waiting for rate-limit weight), keep trying every cycle.
