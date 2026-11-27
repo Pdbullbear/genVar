@@ -10,3 +10,4 @@ dn-*.cmd
 .env.tunnel
 .tunnel-token
 .web-password
+.tunnel.log

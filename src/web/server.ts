@@ -520,7 +520,8 @@ server.listen(PORT, "127.0.0.1", () => {
   }
   console.log(`omni-kit panel (${client.environment}, key ${client.publicKey.slice(0, 10)}…)`);
   console.log(`\n  open:  http://127.0.0.1:${PORT}/?t=${TOKEN}\n`);
-  if (PUBLIC_HOST) console.log(verifyAccess
+  // web:quick prints its own READY line once the tunnel really works, so it silences this one.
+  if (PUBLIC_HOST && !process.env.WEB_QUIET_REMOTE) console.log(verifyAccess
     ? `  remote: https://${PUBLIC_HOST}/?t=${TOKEN}  (Cloudflare Access login required)\n`
     : passwordHash ? `  remote: https://${PUBLIC_HOST}/  (password login required)\n`
     : `  remote: ${PUBLIC_HOST} is REFUSED: no login configured (Cloudflare Access, or WEB_AUTH=password + npm run web:password)\n`);

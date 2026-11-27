@@ -189,8 +189,12 @@ No domain or Cloudflare account setup is needed, only
 npm run web:password   # once: set a password (12+ characters; typing isn't shown)
 npm run web:quick      # starts the quick tunnel and the panel; Ctrl-C stops both
 ```
-- It prints `https://<random-words>.trycloudflare.com`. Open that link and log in with your password.
-  The address changes every time you start it.
+- It prints `READY: https://<random-words>.trycloudflare.com` once the tunnel is connected and the
+  address resolves on public DNS (this takes 10–60 seconds). Open that link and log in with your
+  password. The address changes every time you start it.
+- It uses `--protocol http2` (plain HTTPS on port 443), which gets through most firewalls; set
+  `TUNNEL_PROTOCOL=quic` to use QUIC. If the tunnel can't connect, the launcher says so, shows
+  `cloudflared`'s last messages, and saves the full output to `.tunnel.log`.
 - The panel only answers that exact address remotely, and only after a password login.
 - The password is stored only as a salted scrypt hash in `.web-password`.
 - Sessions last 12 hours, held in a secure, same-site-only cookie. There's a "Log out" button.
